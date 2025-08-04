@@ -62,32 +62,55 @@ def get_pdf_text_from_url_sync(url: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to process PDF: {e}")
 
+# CORRECTED FUNCTION NAME to match the call below
 def get_ai_answers_in_batch_sync(full_document_text: str, questions: List[str]) -> List[str]:
-    """Synchronous function to generate answers using the Gemini model."""
+    """Generates answers using the Gemini model with a more detailed prompt."""
     model = genai.GenerativeModel('gemini-1.5-flash')
+    
     formatted_questions = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
+    
     prompt = f"""
-        You are a specialized AI adjudicator. Your only function is to answer a list of questions based *exclusively* on the provided Document Text. You must be extremely precise.
-        Your answer MUST include the specific quantitative details (numbers, percentages, times) you found.
-        Your entire output MUST be a single, valid JSON array of strings, where each string is the answer to the corresponding question. The number of answers must exactly match the number of questions.
+        You are a specialized AI adjudicator. Your only function is to answer a list of questions based *exclusively* on the provided Document Text. You must be extremely precise and your answers must be in full, explanatory sentences.
 
         **Document Text:**
         ---
         {full_document_text}
         ---
+
         **Questions:**
         {formatted_questions}
-        **Your Final JSON Array Output:**
+
+        **Instructions:**
+
+        1.  **REASONING PHASE (Internal Thought Process for EACH question):**
+            -   For each question, find the most relevant section in the Document Text.
+            -   Extract all key details, including specific numbers, percentages, time periods (e.g., 30 days, 24 months), and conditions.
+
+        2.  **FINAL ANSWER PHASE (CRITICAL):**
+            -   For each question, you MUST formulate a complete, single sentence that directly answers the question.
+            -   **DO NOT just output the data (e.g., "30 days").** Instead, weave the data into a sentence (e.g., "A grace period of thirty days is provided...").
+            -   Your answer should sound like a human expert explaining the policy.
+            -   Your entire output MUST be a single, valid JSON array of strings, where each string is the complete sentence answering the corresponding question.
+
+        **EXAMPLE OF YOUR TASK:**
+        *Question:* What is the grace period for premium payment?
+        *Incorrect Answer (Too short):* ["30 days"]
+        *Correct Answer (Full Sentence):* ["A grace period of thirty days is provided for premium payment after the due date."]
+
+        Now, perform this task for the provided questions and document. Your output must only be the final JSON array of complete sentences.
     """
+    
     try:
         response = model.generate_content(prompt)
         cleaned_text = response.text.strip().replace('```json', '').replace('```', '').strip()
         answers = json.loads(cleaned_text)
+        
         if isinstance(answers, list) and len(answers) == len(questions):
             return answers
         else:
             logging.error("AI response format is invalid.")
             return ["Error: AI response format is invalid."] * len(questions)
+            
     except Exception as e:
         logging.error(f"Failed to get AI response: {e}")
         return [f"Error: An unexpected error occurred with the AI model: {e}"] * len(questions)
