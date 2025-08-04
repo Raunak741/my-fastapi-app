@@ -3,28 +3,25 @@
 import os
 import requests
 import io
-import time
 import json
 import logging
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List
 from dotenv import load_dotenv
 import google.generativeai as genai
 from PyPDF2 import PdfReader
-import google.api_core.exceptions
 
-# --- Configuration and Logging ---
+# --- Configuration and Initialization ---
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
-# --- Environment Variable Validation ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-TEAM_TOKEN = os.getenv("TEAM_TOKEN") # Best practice: load token from env
+TEAM_TOKEN = os.getenv("TEAM_TOKEN")
 
 if not GEMINI_API_KEY or not TEAM_TOKEN:
-    raise ValueError("Required environment variables GEMINI_API_KEY or TEAM_TOKEN are not set.")
+    raise ValueError("GEMINI_API_KEY or TEAM_TOKEN not found in environment variables.")
 
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -40,46 +37,20 @@ def check_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=403, detail="Invalid authorization token")
     return credentials.credentials
 
-# --- Pydantic Models ---
+# --- Pydantic Models for Request and Response ---
 class ApiRequest(BaseModel):
     documents: str
     questions: List[str]
 
+# THIS IS THE REQUIRED RESPONSE FORMAT
 class ApiResponse(BaseModel):
-    # This response is returned immediately
-    message: str
-    task_id: str # A way to track the background job
+    answers: List[str]
 
-# --- Core Logic Functions (to be run in background) ---
-
-def process_document_and_get_answers(document_url: str, questions: List[str], task_id: str):
-    """
-    This entire workflow runs in the background.
-    It handles PDF download, text extraction, and AI processing.
-    """
-    logging.info(f"Task {task_id}: Starting background processing.")
-    try:
-        # Step 1: Download and Extract PDF Text
-        pdf_text = get_pdf_text_from_url(document_url)
-
-        # Step 2: Generate Answers using AI
-        answers = get_ai_answers_in_batch(pdf_text, questions)
-
-        # In a real-world app, you would save these answers to a database
-        # or send them to a webhook using the task_id.
-        logging.info(f"Task {task_id}: Successfully generated answers: {answers}")
-
-    except HTTPException as e:
-        # Log HTTP exceptions that occur within the background task
-        logging.error(f"Task {task_id}: Failed with HTTPException. Status: {e.status_code}, Detail: {e.detail}")
-    except Exception as e:
-        # Log any other unexpected errors
-        logging.error(f"Task {task_id}: An unexpected error occurred: {e}")
-
+# --- Core Logic Functions ---
 def get_pdf_text_from_url(url: str) -> str:
-    """Downloads and extracts text from a PDF URL."""
+    """Downloads a PDF from a URL and extracts its text content."""
     try:
-        response = requests.get(url, timeout=30) # Add a timeout
+        response = requests.get(url, timeout=30) # 30-second timeout for the download
         response.raise_for_status()
         
         pdf_stream = io.BytesIO(response.content)
@@ -91,21 +62,20 @@ def get_pdf_text_from_url(url: str) -> str:
             raise ValueError("Could not extract any text from the PDF.")
         return text
     except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download PDF: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to download PDF from URL: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to process PDF: {e}")
 
 def get_ai_answers_in_batch(full_document_text: str, questions: List[str]) -> List[str]:
-    """Generates answers using the Gemini model with retry logic."""
+    """Generates answers for a batch of questions from the Gemini model."""
     model = genai.GenerativeModel('gemini-1.5-flash')
     
     formatted_questions = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
     
-    # Using a clear, structured prompt improves model performance
     prompt = f"""
         You are an AI adjudicator. Based ONLY on the Document Text provided, answer the questions.
         Your entire output must be a single, valid JSON array of strings, where each string is the direct answer to the corresponding question.
-        The number of answers must exactly match the number of questions.
+        The number of answers must exactly match the number of questions. Do not include any other text, reasoning, or markdown.
 
         **Document Text:**
         ---
@@ -118,52 +88,41 @@ def get_ai_answers_in_batch(full_document_text: str, questions: List[str]) -> Li
         **Your Final JSON Array Output:**
     """
     
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = model.generate_content(prompt)
-            cleaned_text = response.text.strip().replace("```json", "").replace("```", "").strip()
-            answers = json.loads(cleaned_text)
-            
-            if isinstance(answers, list) and len(answers) == len(questions):
-                return answers
-            else:
-                raise ValueError("AI response format is invalid (mismatched answer count or not a list).")
+    try:
+        response = model.generate_content(prompt)
+        cleaned_text = response.text.strip().replace('```json', '').replace('```', '').strip()
+        answers = json.loads(cleaned_text)
         
-        except (json.JSONDecodeError, ValueError) as e:
-            logging.warning(f"Attempt {attempt + 1} failed: {e}. Retrying...")
-            if attempt == max_retries - 1:
-                raise HTTPException(status_code=500, detail=f"Failed to parse AI response: {e}")
-            time.sleep(2 ** attempt)
-        except Exception as e:
-            logging.error(f"An unexpected error occurred with the AI model: {e}")
-            raise HTTPException(status_code=500, detail=f"An unexpected error occurred with the AI model: {e}")
+        if isinstance(answers, list) and len(answers) == len(questions):
+            return answers
+        else:
+            logging.error("AI response format is invalid (mismatched answer count or not a list).")
+            # Return error messages for each question if format is wrong
+            return [f"Error: AI response format is invalid."] * len(questions)
+            
+    except Exception as e:
+        logging.error(f"Failed to get AI response: {e}")
+        # Return error messages for each question on failure
+        return [f"Error: Failed to generate AI response. Details: {e}"] * len(questions)
 
-# --- API Endpoint ---
-
-@app.post("/hackrx/run", response_model=ApiResponse, status_code=202)
-async def process_request(
-    request: ApiRequest,
-    background_tasks: BackgroundTasks,
-    token: str = Depends(check_token)
-):
+# --- API Endpoint (Synchronous) ---
+@app.post("/hackrx/run", response_model=ApiResponse)
+async def process_request(request: ApiRequest, token: str = Depends(check_token)):
     """
-    Accepts the request, responds immediately, and processes the document
-    and questions in the background to avoid timeouts.
+    Main endpoint to process documents and questions synchronously.
     """
-    task_id = os.urandom(8).hex() # Generate a simple, unique ID for the task
+    logging.info("Starting synchronous processing for request...")
     
-    background_tasks.add_task(
-        process_document_and_get_answers,
-        document_url=request.documents,
-        questions=request.questions,
-        task_id=task_id
-    )
+    # Step 1: Get PDF text. This can be slow.
+    pdf_text = get_pdf_text_from_url(request.documents)
     
-    return ApiResponse(
-        message="Request accepted. Processing is happening in the background.",
-        task_id=task_id
-    )
+    # Step 2: Get answers from AI. This can also be slow.
+    answers = get_ai_answers_in_batch(pdf_text, request.questions)
+    
+    logging.info("Processing complete. Returning answers.")
+    
+    # Step 3: Return the answers in the required format.
+    return ApiResponse(answers=answers)
 
 @app.get("/")
 def read_root():
