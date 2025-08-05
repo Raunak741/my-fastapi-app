@@ -7,7 +7,8 @@ import json
 import logging
 import asyncio
 import numpy as np
-import re # <-- NEW IMPORT for smarter splitting
+import re
+import time # <-- NEW IMPORT
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -15,6 +16,7 @@ from typing import List
 from dotenv import load_dotenv
 import google.generativeai as genai
 from PyPDF2 import PdfReader
+from google.api_core import exceptions as google_exceptions # <-- NEW IMPORT for specific exception
 
 # --- Configuration and Initialization ---
 # (No changes here)
@@ -59,34 +61,37 @@ def get_pdf_text_from_url_sync(url: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to process PDF: {e}")
 
-# --- NEW: ADVANCED CHUNKING FUNCTION ---
 def get_text_chunks_advanced(text: str) -> List[str]:
-    """Splits text into semantically meaningful chunks."""
-    # Split by paragraphs first
+    # (No changes here)
     chunks = text.split('\n\n')
-    # Further split long paragraphs by sentences
     final_chunks = []
     for chunk in chunks:
-        if len(chunk) > 1000: # If a chunk is very long, split by sentence
+        if len(chunk) > 1000:
             sentences = re.split(r'(?<=[.!?]) +', chunk)
             final_chunks.extend(sentences)
         else:
             final_chunks.append(chunk)
-    # Filter out any empty strings
     return [c.strip() for c in final_chunks if c.strip()]
 
 
 def get_ai_answers_with_rag(full_document_text: str, questions: List[str]) -> List[str]:
     """
-    Generates answers using an ADVANCED RAG approach.
+    Generates answers using an ADVANCED RAG approach with rate-limit handling.
     """
-    # 1. Chunking: Use the new advanced chunking function
     text_chunks = get_text_chunks_advanced(full_document_text)
     if not text_chunks:
         return ["Error: Document has no text content."] * len(questions)
 
-    # 2. Embedding: Create embeddings for all text chunks
     try:
+        # This can also be rate-limited, so we add a retry here too
+        chunk_embeddings = genai.embed_content(
+            model='models/text-embedding-004',
+            content=text_chunks,
+            task_type="RETRIEVAL_DOCUMENT"
+        )['embedding']
+    except google_exceptions.ResourceExhausted as e:
+        logging.warning("Rate limit hit while embedding chunks. Waiting 20 seconds...")
+        time.sleep(20)
         chunk_embeddings = genai.embed_content(
             model='models/text-embedding-004',
             content=text_chunks,
@@ -97,50 +102,48 @@ def get_ai_answers_with_rag(full_document_text: str, questions: List[str]) -> Li
         return [f"Error creating document embeddings: {e}"] * len(questions)
 
     answers = []
-    # --- EXPERIMENT HERE: Try 'gemini-1.5-pro' for potentially higher quality answers ---
-    generative_model = genai.GenerativeModel('gemini-1.5-flash')
+    generative_model = genai.GenerativeModel('gemini-1.5-pro') # Using Pro for higher quality
 
     for question in questions:
-        try:
-            # Embed the single question
-            question_embedding = genai.embed_content(
-                model='models/text-embedding-004',
-                content=question,
-                task_type="RETRIEVAL_QUERY"
-            )['embedding']
+        for attempt in range(3): # Retry up to 3 times for each question
+            try:
+                question_embedding = genai.embed_content(
+                    model='models/text-embedding-004',
+                    content=question,
+                    task_type="RETRIEVAL_QUERY"
+                )['embedding']
 
-            # 3. Searching: Find the most relevant chunks
-            dot_products = np.dot(np.array(chunk_embeddings), np.array(question_embedding))
-            top_indices = np.argsort(dot_products)[-5:][::-1] # Top 5 chunks
-            relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in top_indices])
+                dot_products = np.dot(np.array(chunk_embeddings), np.array(question_embedding))
+                top_indices = np.argsort(dot_products)[-5:][::-1]
+                relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in top_indices])
 
-            # 4. Answering: Use the NEW, more advanced prompt for synthesis
-            prompt = f"""
-                You are an expert AI research analyst. Your task is to synthesize a single, clear, and accurate answer to the "Question" based *only* on the provided "Sources".
+                prompt = f"""
+                    You are an expert AI research analyst. Your task is to synthesize a single, clear, and accurate answer to the "Question" based *only* on the provided "Sources".
+                    **Sources:** --- {relevant_context} ---
+                    **Question:** {question}
+                    **Instructions:**
+                    1. Carefully read all the provided sources.
+                    2. Synthesize the information to formulate a single, comprehensive, and well-written answer.
+                    3. If the sources do not contain enough information, state: "Based on the provided information, a definitive answer could not be found."
+                    **Final Answer:**
+                """
+                
+                response = generative_model.generate_content(prompt)
+                answers.append(response.text.strip())
+                break # If successful, break the retry loop
 
-                **Sources:**
-                ---
-                {relevant_context}
-                ---
-
-                **Question:** {question}
-
-                **Instructions:**
-                1.  Carefully read all the provided sources.
-                2.  Synthesize the information from these sources to formulate a single, comprehensive, and well-written answer.
-                3.  Your answer must be a direct response to the question.
-                4.  If the sources do not contain enough information to answer the question, you must state: "Based on the provided information, a definitive answer could not be found."
-                5.  Do not add any information that is not present in the sources.
-
-                **Final Answer:**
-            """
+            except google_exceptions.ResourceExhausted as e:
+                wait_time = (attempt + 1) * 15 # Wait 15s, then 30s
+                logging.warning(f"Rate limit hit on question '{question}'. Waiting {wait_time}s... Attempt {attempt + 1}/3")
+                if attempt < 2:
+                    time.sleep(wait_time)
+                else:
+                    answers.append(f"Error: Rate limit exceeded after multiple retries.")
             
-            response = generative_model.generate_content(prompt)
-            answers.append(response.text.strip())
-
-        except Exception as e:
-            logging.error(f"Failed to process question '{question}': {e}")
-            answers.append(f"Error processing question: {e}")
+            except Exception as e:
+                logging.error(f"Failed to process question '{question}': {e}")
+                answers.append(f"Error processing question: {e}")
+                break # Don't retry on other errors
 
     return answers
 
