@@ -58,12 +58,14 @@ def get_pdf_text_from_url_sync(url: str) -> str:
     try:
         response = requests.get(url, timeout=60)
         response.raise_for_status()
-        # --- STRATEGIC CHANGE: Process only the first 100 pages for large docs ---
         doc = fitz.open(stream=response.content, filetype="pdf")
         
-        page_limit = 100
+        # --- FINAL STABILITY FIX: A more aggressive page limit to prevent memory crashes ---
+        # We process a maximum of 50 pages for very large documents. This is a trade-off
+        # to ensure the server never runs out of memory on the free tier.
+        page_limit = 50
         if doc.page_count > page_limit:
-            logging.warning(f"Document has {doc.page_count} pages. Processing only the first {page_limit} to save memory.")
+            logging.warning(f"Document has {doc.page_count} pages. Processing only the first {page_limit} to guarantee stability.")
             pages_to_process = range(page_limit)
         else:
             pages_to_process = range(doc.page_count)
@@ -104,7 +106,6 @@ async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
             top_indices = np.argsort(dot_products)[-7:][::-1]
             relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in top_indices])
             
-            # --- FINAL, SIMPLIFIED PROMPT FOR CLEAN OUTPUT ---
             prompt = f"""
                 You are an expert AI research analyst. Your task is to synthesize a single, clear, and accurate answer to the "Question" based *only* on the provided "Sources".
 
@@ -166,7 +167,8 @@ async def process_request(request: ApiRequest, token: str = Depends(check_token)
     for question in request.questions:
         answer = await get_single_answer(question, cached_data)
         answers.append(answer)
-        await asyncio.sleep(1)
+        # --- FINAL SPEED OPTIMIZATION: Removed the 1-second sleep ---
+        # The natural latency of the API calls should be enough to manage the rate limit.
 
     logging.info("Processing complete. Returning all answers.")
     return ApiResponse(answers=answers)
