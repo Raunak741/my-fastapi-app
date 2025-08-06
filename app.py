@@ -8,18 +8,17 @@ import logging
 import asyncio
 import numpy as np
 import re
-import time # <-- NEW IMPORT
+import time
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import List
+from typing import List, Dict, Any # <-- UPDATED IMPORT
 from dotenv import load_dotenv
 import google.generativeai as genai
 from PyPDF2 import PdfReader
-from google.api_core import exceptions as google_exceptions # <-- NEW IMPORT for specific exception
+from google.api_core import exceptions as google_exceptions
 
 # --- Configuration and Initialization ---
-# (No changes here)
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -28,8 +27,11 @@ if not GEMINI_API_KEY or not TEAM_TOKEN:
     raise ValueError("Required environment variables GEMINI_API_KEY or TEAM_TOKEN are not set.")
 genai.configure(api_key=GEMINI_API_KEY)
 
+# --- NEW: In-Memory Cache ---
+# This dictionary will store the processed documents to avoid re-doing work.
+document_cache: Dict[str, Dict[str, Any]] = {}
+
 # --- FastAPI App and Authentication ---
-# (No changes here)
 app = FastAPI()
 security = HTTPBearer()
 def check_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -38,7 +40,6 @@ def check_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     return credentials.credentials
 
 # --- Pydantic Models ---
-# (No changes here)
 class ApiRequest(BaseModel):
     documents: str
     questions: List[str]
@@ -46,9 +47,8 @@ class ApiResponse(BaseModel):
     answers: List[str]
 
 # --- Core Logic Functions ---
-
+# (get_pdf_text_from_url_sync and get_text_chunks_advanced are unchanged)
 def get_pdf_text_from_url_sync(url: str) -> str:
-    # (No changes here)
     try:
         response = requests.get(url, timeout=60)
         response.raise_for_status()
@@ -62,7 +62,6 @@ def get_pdf_text_from_url_sync(url: str) -> str:
         raise HTTPException(status_code=500, detail=f"Failed to process PDF: {e}")
 
 def get_text_chunks_advanced(text: str) -> List[str]:
-    # (No changes here)
     chunks = text.split('\n\n')
     final_chunks = []
     for chunk in chunks:
@@ -74,38 +73,18 @@ def get_text_chunks_advanced(text: str) -> List[str]:
     return [c.strip() for c in final_chunks if c.strip()]
 
 
-def get_ai_answers_with_rag(full_document_text: str, questions: List[str]) -> List[str]:
+def get_ai_answers_with_rag(cached_data: Dict[str, Any], questions: List[str]) -> List[str]:
     """
-    Generates answers using an ADVANCED RAG approach with rate-limit handling.
+    This function now takes the CACHED chunks and embeddings, making it much faster.
     """
-    text_chunks = get_text_chunks_advanced(full_document_text)
-    if not text_chunks:
-        return ["Error: Document has no text content."] * len(questions)
-
-    try:
-        # This can also be rate-limited, so we add a retry here too
-        chunk_embeddings = genai.embed_content(
-            model='models/text-embedding-004',
-            content=text_chunks,
-            task_type="RETRIEVAL_DOCUMENT"
-        )['embedding']
-    except google_exceptions.ResourceExhausted as e:
-        logging.warning("Rate limit hit while embedding chunks. Waiting 20 seconds...")
-        time.sleep(20)
-        chunk_embeddings = genai.embed_content(
-            model='models/text-embedding-004',
-            content=text_chunks,
-            task_type="RETRIEVAL_DOCUMENT"
-        )['embedding']
-    except Exception as e:
-        logging.error(f"Failed to create embeddings for document chunks: {e}")
-        return [f"Error creating document embeddings: {e}"] * len(questions)
-
+    text_chunks = cached_data["chunks"]
+    chunk_embeddings = cached_data["embeddings"]
+    
     answers = []
-    generative_model = genai.GenerativeModel('gemini-1.5-pro') # Using Pro for higher quality
+    generative_model = genai.GenerativeModel('gemini-1.5-pro')
 
     for question in questions:
-        for attempt in range(3): # Retry up to 3 times for each question
+        for attempt in range(3):
             try:
                 question_embedding = genai.embed_content(
                     model='models/text-embedding-004',
@@ -130,10 +109,10 @@ def get_ai_answers_with_rag(full_document_text: str, questions: List[str]) -> Li
                 
                 response = generative_model.generate_content(prompt)
                 answers.append(response.text.strip())
-                break # If successful, break the retry loop
+                break 
 
             except google_exceptions.ResourceExhausted as e:
-                wait_time = (attempt + 1) * 15 # Wait 15s, then 30s
+                wait_time = (attempt + 1) * 15 
                 logging.warning(f"Rate limit hit on question '{question}'. Waiting {wait_time}s... Attempt {attempt + 1}/3")
                 if attempt < 2:
                     time.sleep(wait_time)
@@ -143,23 +122,52 @@ def get_ai_answers_with_rag(full_document_text: str, questions: List[str]) -> Li
             except Exception as e:
                 logging.error(f"Failed to process question '{question}': {e}")
                 answers.append(f"Error processing question: {e}")
-                break # Don't retry on other errors
+                break 
 
     return answers
 
-# --- API Endpoint ---
-# (No changes here)
+# --- API Endpoint with Caching Logic ---
 @app.post("/hackrx/run", response_model=ApiResponse)
 async def process_request(request: ApiRequest, token: str = Depends(check_token)):
-    logging.info(f"Processing request for document: {request.documents}")
-    try:
-        pdf_text = await asyncio.to_thread(get_pdf_text_from_url_sync, request.documents)
-        answers = await asyncio.to_thread(get_ai_answers_with_rag, pdf_text, request.questions)
-        logging.info("Processing complete. Returning answers.")
-        return ApiResponse(answers=answers)
-    except Exception as e:
-        logging.error(f"An unexpected error occurred in process_request: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    document_url = request.documents
+    logging.info(f"Processing request for document: {document_url}")
+
+    # --- NEW CACHING LOGIC ---
+    if document_url not in document_cache:
+        logging.info(f"'{document_url}' not in cache. Processing and caching now...")
+        try:
+            # 1. Slow step: Download and chunk the document
+            pdf_text = await asyncio.to_thread(get_pdf_text_from_url_sync, document_url)
+            text_chunks = get_text_chunks_advanced(pdf_text)
+
+            # 2. Slow/Expensive step: Create embeddings for all chunks
+            chunk_embeddings = await asyncio.to_thread(
+                lambda: genai.embed_content(
+                    model='models/text-embedding-004',
+                    content=text_chunks,
+                    task_type="RETRIEVAL_DOCUMENT"
+                )['embedding']
+            )
+            
+            # Store the processed data in the cache
+            document_cache[document_url] = {
+                "chunks": text_chunks,
+                "embeddings": chunk_embeddings
+            }
+            logging.info(f"Successfully cached '{document_url}'.")
+
+        except Exception as e:
+            logging.error(f"Failed to process and cache document: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to process document: {e}")
+    else:
+        logging.info(f"Found '{document_url}' in cache. Using cached data.")
+
+    # Use the cached data to get answers
+    cached_data = document_cache[document_url]
+    answers = await asyncio.to_thread(get_ai_answers_with_rag, cached_data, request.questions)
+    
+    logging.info("Processing complete. Returning answers.")
+    return ApiResponse(answers=answers)
 
 @app.get("/")
 def read_root():
