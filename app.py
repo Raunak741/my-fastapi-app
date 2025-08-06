@@ -90,7 +90,7 @@ def get_text_chunks_advanced(text: str) -> List[str]:
     return [c.strip() for c in final_chunks if c.strip()]
 
 async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
-    """Processes one question with improved retrieval and Chain-of-Thought prompting."""
+    """Processes one question with a simplified prompt for clean output."""
     text_chunks = cached_data["chunks"]
     chunk_embeddings = cached_data["embeddings"]
     generative_model = genai.GenerativeModel('gemini-1.5-pro')
@@ -104,17 +104,9 @@ async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
             top_indices = np.argsort(dot_products)[-7:][::-1]
             relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in top_indices])
             
+            # --- FINAL, SIMPLIFIED PROMPT FOR CLEAN OUTPUT ---
             prompt = f"""
-                You are an expert AI research analyst. Follow these steps precisely to answer the question based *only* on the provided sources.
-
-                **Step 1: Fact Extraction**
-                Carefully read the following sources and identify all facts, figures, and clauses relevant to the question. List them out as bullet points.
-
-                **Step 2: Reasoning**
-                Based on the extracted facts, explain your step-by-step reasoning for how you will arrive at the final answer. Consider any conflicting clauses or conditions.
-
-                **Step 3: Final Answer**
-                Synthesize your reasoning into a single, clear, and comprehensive final answer. This final answer should be the only thing you output after completing the first two steps internally.
+                You are an expert AI research analyst. Your task is to synthesize a single, clear, and accurate answer to the "Question" based *only* on the provided "Sources".
 
                 **Sources:**
                 ---
@@ -122,6 +114,12 @@ async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
                 ---
 
                 **Question:** {question}
+
+                **Instructions:**
+                - Read all the sources carefully.
+                - Synthesize the information to formulate a single, comprehensive, and well-written final answer.
+                - If the sources do not contain enough information, state: "Based on the provided information, a definitive answer could not be found."
+                - **Your output must ONLY be the final answer sentence. Do not include any steps, reasoning, or other text.**
 
                 **Final Answer:**
             """
