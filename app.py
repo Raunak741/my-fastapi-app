@@ -60,9 +60,6 @@ def get_pdf_text_from_url_sync(url: str) -> str:
         response.raise_for_status()
         doc = fitz.open(stream=response.content, filetype="pdf")
         
-        # --- FINAL STABILITY FIX: A more aggressive page limit to prevent memory crashes ---
-        # We process a maximum of 50 pages for very large documents. This is a trade-off
-        # to ensure the server never runs out of memory on the free tier.
         page_limit = 50
         if doc.page_count > page_limit:
             logging.warning(f"Document has {doc.page_count} pages. Processing only the first {page_limit} to guarantee stability.")
@@ -92,21 +89,46 @@ def get_text_chunks_advanced(text: str) -> List[str]:
     return [c.strip() for c in final_chunks if c.strip()]
 
 async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
-    """Processes one question with a simplified prompt for clean output."""
+    """Processes one question using Multi-Query RAG for maximum accuracy."""
     text_chunks = cached_data["chunks"]
     chunk_embeddings = cached_data["embeddings"]
     generative_model = genai.GenerativeModel('gemini-1.5-pro')
-
+    
     for attempt in range(3):
         try:
-            question_embedding = await asyncio.to_thread(
-                lambda: genai.embed_content(model='models/text-embedding-004', content=question, task_type="RETRIEVAL_QUERY")['embedding']
-            )
-            dot_products = np.dot(np.array(chunk_embeddings), np.array(question_embedding))
-            top_indices = np.argsort(dot_products)[-7:][::-1]
-            relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in top_indices])
+            # --- NEW: Multi-Query Generation ---
+            query_gen_prompt = f"""
+            You are an expert at rephrasing questions for a retrieval system.
+            Given the following question, generate 3 additional, different phrasings of it.
+            The phrasings should be diverse and cover different angles or keywords.
+            Your output MUST be a valid JSON array of strings.
             
-            prompt = f"""
+            Original Question: "{question}"
+            
+            JSON Array of Rephrased Questions:
+            """
+            query_gen_model = genai.GenerativeModel('gemini-1.5-flash')
+            response = await asyncio.to_thread(lambda: query_gen_model.generate_content(query_gen_prompt))
+            rephrased_questions = json.loads(response.text)
+            all_queries = [question] + rephrased_questions
+
+            # --- Embed all queries ---
+            query_embeddings = await asyncio.to_thread(
+                lambda: genai.embed_content(model='models/text-embedding-004', content=all_queries, task_type="RETRIEVAL_QUERY")['embedding']
+            )
+
+            # --- Retrieve and combine results for all queries ---
+            all_top_indices = set()
+            for embedding in query_embeddings:
+                dot_products = np.dot(np.array(chunk_embeddings), np.array(embedding))
+                # Retrieve top 3 chunks for each query to get a diverse set
+                top_indices = np.argsort(dot_products)[-3:][::-1]
+                all_top_indices.update(top_indices)
+
+            relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in all_top_indices])
+            
+            # --- Final Answer Generation ---
+            final_prompt = f"""
                 You are an expert AI research analyst. Your task is to synthesize a single, clear, and accurate answer to the "Question" based *only* on the provided "Sources".
 
                 **Sources:**
@@ -117,18 +139,18 @@ async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
                 **Question:** {question}
 
                 **Instructions:**
-                - Read all the sources carefully.
                 - Synthesize the information to formulate a single, comprehensive, and well-written final answer.
                 - If the sources do not contain enough information, state: "Based on the provided information, a definitive answer could not be found."
-                - **Your output must ONLY be the final answer sentence. Do not include any steps, reasoning, or other text.**
+                - **Your output must ONLY be the final answer sentence.**
 
                 **Final Answer:**
             """
-            response = await asyncio.to_thread(lambda: generative_model.generate_content(prompt))
-            return response.text.strip()
+            final_response = await asyncio.to_thread(lambda: generative_model.generate_content(final_prompt))
+            return final_response.text.strip()
+
         except google_exceptions.ResourceExhausted as e:
             wait_time = (attempt + 1) * 10
-            logging.warning(f"Rate limit hit on '{question}'. Waiting {wait_time}s...")
+            logging.warning(f"Rate limit hit. Waiting {wait_time}s...")
             if attempt < 2:
                 await asyncio.sleep(wait_time)
             else:
@@ -167,8 +189,6 @@ async def process_request(request: ApiRequest, token: str = Depends(check_token)
     for question in request.questions:
         answer = await get_single_answer(question, cached_data)
         answers.append(answer)
-        # --- FINAL SPEED OPTIMIZATION: Removed the 1-second sleep ---
-        # The natural latency of the API calls should be enough to manage the rate limit.
 
     logging.info("Processing complete. Returning all answers.")
     return ApiResponse(answers=answers)
