@@ -63,53 +63,51 @@ def get_pdf_text_from_url_sync(url: str) -> str:
         response.raise_for_status()
         pdf_content = response.content
         
-        # --- 1. First attempt with standard text extraction ---
+        # --- Open the document to get initial info ---
         doc = fitz.open(stream=pdf_content, filetype="pdf")
+        page_count = doc.page_count # Get page count before closing
         text = "".join(page.get_text() for page in doc)
-        doc.close()
+        doc.close() # Close the document now that we have the info
 
-        # --- 2. Smart Detection: Check if the PDF is likely scanned ---
-        # A simple heuristic: if a multi-page PDF has very little text, it's probably scanned.
-        if doc.page_count > 1 and len(text.strip()) < (100 * doc.page_count):
+        # --- Smart Detection: Check if the PDF is likely scanned ---
+        if page_count > 1 and len(text.strip()) < (100 * page_count):
             logging.warning(f"Low text detected. Attempting OCR with Google Cloud Vision for {url}")
             
-            # --- 3. OCR Processing ---
+            # --- OCR Processing ---
             client = vision.ImageAnnotatorClient()
             gcs_feature = vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)
-            
-            # Prepare the request for the Vision API
             gcs_input_config = vision.InputConfig(content=pdf_content, mime_type='application/pdf')
             gcs_request = vision.AnnotateFileRequest(input_config=gcs_input_config, features=[gcs_feature])
-
-            # Send the request
             gcs_response = client.batch_annotate_files(requests=[gcs_request])
             
-            # Extract the text from the OCR response
             full_text = ""
             for image_response in gcs_response.responses[0].responses:
                 if image_response.full_text_annotation:
                     full_text += image_response.full_text_annotation.text + "\n"
-            text = full_text
+            text = full_text # Overwrite initial text with OCR text
 
-        # --- 4. Final Processing for Memory Safety ---
-        doc = fitz.open(stream=io.BytesIO(pdf_content), filetype="pdf")
+        # --- Final Processing for Memory Safety ---
         page_limit = 50
-        if doc.page_count > page_limit:
-            logging.warning(f"Document has {doc.page_count} pages. Processing only the first {page_limit} to guarantee stability.")
-            # Re-extract text from the limited pages to ensure consistency
+        if page_count > page_limit:
+            logging.warning(f"Document has {page_count} pages. Processing only the first {page_limit} to guarantee stability.")
+            
+            # Re-open the doc to get the limited text for truncation
+            doc = fitz.open(stream=io.BytesIO(pdf_content), filetype="pdf")
             limited_text = "".join(doc[i].get_text() for i in range(page_limit))
-            # If OCR was used, we have to truncate the full text string
-            if len(text) > len(limited_text): # A rough check to see if OCR text is larger
-                 # This is an approximation, but it's the safest way to handle memory for large OCR'd docs
-                 text = text[:int(len(text) * (page_limit / doc.page_count))]
+            doc.close()
+
+            # If OCR was used, the text variable contains the full OCR'd text. We need to truncate it.
+            # If OCR was not used, the text variable contains the full PyMuPDF text. We just replace it.
+            if len(text) > len(limited_text) and page_count > 0:
+                 text = text[:int(len(text) * (page_limit / page_count))]
             else:
                 text = limited_text
-        doc.close()
 
         if not text.strip():
             raise ValueError("Could not extract any text from the PDF, even after attempting OCR.")
         return text
     except Exception as e:
+        logging.error(f"Full error in get_pdf_text_from_url_sync: {e}", exc_info=True)
         raise RuntimeError(f"Failed to process PDF: {e}")
 
 def get_text_chunks_advanced(text: str) -> List[str]:
