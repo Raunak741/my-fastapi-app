@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 import fitz  # PyMuPDF
 from google.api_core import exceptions as google_exceptions
+from google.cloud import vision # <-- NEW IMPORT FOR OCR
 
 # --- Configuration and Initialization ---
 logging.basicConfig(level=logging.INFO)
@@ -54,24 +55,59 @@ class ApiResponse(BaseModel):
 
 # --- Core Logic Functions ---
 def get_pdf_text_from_url_sync(url: str) -> str:
-    """Downloads and extracts text using the fast PyMuPDF library."""
+    """
+    Downloads and extracts text using PyMuPDF, with a fallback to Google Cloud Vision OCR for scanned PDFs.
+    """
     try:
-        response = requests.get(url, timeout=60)
+        response = requests.get(url, timeout=90) # Increased timeout for potentially larger files
         response.raise_for_status()
-        doc = fitz.open(stream=response.content, filetype="pdf")
+        pdf_content = response.content
         
+        # --- 1. First attempt with standard text extraction ---
+        doc = fitz.open(stream=pdf_content, filetype="pdf")
+        text = "".join(page.get_text() for page in doc)
+        doc.close()
+
+        # --- 2. Smart Detection: Check if the PDF is likely scanned ---
+        # A simple heuristic: if a multi-page PDF has very little text, it's probably scanned.
+        if doc.page_count > 1 and len(text.strip()) < (100 * doc.page_count):
+            logging.warning(f"Low text detected. Attempting OCR with Google Cloud Vision for {url}")
+            
+            # --- 3. OCR Processing ---
+            client = vision.ImageAnnotatorClient()
+            gcs_feature = vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)
+            
+            # Prepare the request for the Vision API
+            gcs_input_config = vision.InputConfig(content=pdf_content, mime_type='application/pdf')
+            gcs_request = vision.AnnotateFileRequest(input_config=gcs_input_config, features=[gcs_feature])
+
+            # Send the request
+            gcs_response = client.batch_annotate_files(requests=[gcs_request])
+            
+            # Extract the text from the OCR response
+            full_text = ""
+            for image_response in gcs_response.responses[0].responses:
+                if image_response.full_text_annotation:
+                    full_text += image_response.full_text_annotation.text + "\n"
+            text = full_text
+
+        # --- 4. Final Processing for Memory Safety ---
+        doc = fitz.open(stream=io.BytesIO(pdf_content), filetype="pdf")
         page_limit = 50
         if doc.page_count > page_limit:
             logging.warning(f"Document has {doc.page_count} pages. Processing only the first {page_limit} to guarantee stability.")
-            pages_to_process = range(page_limit)
-        else:
-            pages_to_process = range(doc.page_count)
-            
-        text = "".join(doc[i].get_text() for i in pages_to_process)
+            # Re-extract text from the limited pages to ensure consistency
+            limited_text = "".join(doc[i].get_text() for i in range(page_limit))
+            # If OCR was used, we have to truncate the full text string
+            if len(text) > len(limited_text): # A rough check to see if OCR text is larger
+                 # This is an approximation, but it's the safest way to handle memory for large OCR'd docs
+                 text = text[:int(len(text) * (page_limit / doc.page_count))]
+            else:
+                text = limited_text
         doc.close()
-        
+
         if not text.strip():
-            raise ValueError("Could not extract text from the PDF.")
+            raise ValueError("Could not extract any text from the PDF, even after attempting OCR.")
         return text
     except Exception as e:
         raise RuntimeError(f"Failed to process PDF: {e}")
@@ -96,11 +132,9 @@ async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
     
     for attempt in range(3):
         try:
-            # --- Multi-Query Generation with Robust JSON Parsing ---
             query_gen_prompt = f"""
             You are an expert at rephrasing questions for a retrieval system.
             Given the following question, generate 3 additional, different phrasings of it.
-            The phrasings should be diverse and cover different angles or keywords.
             Your output MUST be a valid JSON array of strings.
             
             Original Question: "{question}"
@@ -110,9 +144,7 @@ async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
             query_gen_model = genai.GenerativeModel('gemini-1.5-flash')
             response = await asyncio.to_thread(lambda: query_gen_model.generate_content(query_gen_prompt))
             
-            # --- FINAL FIX: Robust JSON Parsing ---
             try:
-                # Clean up potential markdown fences before parsing
                 cleaned_text = response.text.strip().replace('```json', '').replace('```', '').strip()
                 rephrased_questions = json.loads(cleaned_text)
                 all_queries = [question] + rephrased_questions
@@ -120,12 +152,10 @@ async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
                 logging.warning(f"Could not parse rephrased questions for '{question}'. Falling back to original question only.")
                 all_queries = [question]
 
-            # --- Embed all queries ---
             query_embeddings = await asyncio.to_thread(
                 lambda: genai.embed_content(model='models/text-embedding-004', content=all_queries, task_type="RETRIEVAL_QUERY")['embedding']
             )
 
-            # --- Retrieve and combine results for all queries ---
             all_top_indices = set()
             for embedding in query_embeddings:
                 dot_products = np.dot(np.array(chunk_embeddings), np.array(embedding))
@@ -134,7 +164,6 @@ async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
 
             relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in all_top_indices])
             
-            # --- Final Answer Generation ---
             final_prompt = f"""
                 You are an expert AI research analyst. Your task is to synthesize a single, clear, and accurate answer to the "Question" based *only* on the provided "Sources".
 
