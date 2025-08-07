@@ -17,7 +17,8 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 import fitz  # PyMuPDF
 from google.api_core import exceptions as google_exceptions
-from google.cloud import vision # <-- NEW IMPORT FOR OCR
+from google.cloud import vision
+import faiss # <-- NEW IMPORT FOR ON-DISK INDEXING
 
 # --- Configuration and Initialization ---
 logging.basicConfig(level=logging.INFO)
@@ -31,8 +32,12 @@ if not GEMINI_API_KEY or not TEAM_TOKEN:
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# --- Caching Dictionary ---
-document_cache: Dict[str, Dict[str, Any]] = {}
+# --- On-Disk Cache Management ---
+CACHE_DIR = "faiss_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+# We will store the text chunks separately in memory, as they are smaller.
+text_chunk_cache: Dict[str, List[str]] = {}
+
 
 # --- FastAPI App Initialization ---
 app = FastAPI()
@@ -55,59 +60,17 @@ class ApiResponse(BaseModel):
 
 # --- Core Logic Functions ---
 def get_pdf_text_from_url_sync(url: str) -> str:
-    """
-    Downloads and extracts text using PyMuPDF, with a fallback to Google Cloud Vision OCR for scanned PDFs.
-    """
+    """Downloads and extracts all text from a PDF using PyMuPDF."""
     try:
-        response = requests.get(url, timeout=90) # Increased timeout for potentially larger files
+        response = requests.get(url, timeout=120) # Longer timeout for large files
         response.raise_for_status()
-        pdf_content = response.content
-        
-        # --- Open the document to get initial info ---
-        doc = fitz.open(stream=pdf_content, filetype="pdf")
-        page_count = doc.page_count # Get page count before closing
+        doc = fitz.open(stream=response.content, filetype="pdf")
         text = "".join(page.get_text() for page in doc)
-        doc.close() # Close the document now that we have the info
-
-        # --- Smart Detection: Check if the PDF is likely scanned ---
-        if page_count > 1 and len(text.strip()) < (100 * page_count):
-            logging.warning(f"Low text detected. Attempting OCR with Google Cloud Vision for {url}")
-            
-            # --- OCR Processing ---
-            client = vision.ImageAnnotatorClient()
-            gcs_feature = vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)
-            gcs_input_config = vision.InputConfig(content=pdf_content, mime_type='application/pdf')
-            gcs_request = vision.AnnotateFileRequest(input_config=gcs_input_config, features=[gcs_feature])
-            gcs_response = client.batch_annotate_files(requests=[gcs_request])
-            
-            full_text = ""
-            for image_response in gcs_response.responses[0].responses:
-                if image_response.full_text_annotation:
-                    full_text += image_response.full_text_annotation.text + "\n"
-            text = full_text # Overwrite initial text with OCR text
-
-        # --- Final Processing for Memory Safety ---
-        page_limit = 50
-        if page_count > page_limit:
-            logging.warning(f"Document has {page_count} pages. Processing only the first {page_limit} to guarantee stability.")
-            
-            # Re-open the doc to get the limited text for truncation
-            doc = fitz.open(stream=io.BytesIO(pdf_content), filetype="pdf")
-            limited_text = "".join(doc[i].get_text() for i in range(page_limit))
-            doc.close()
-
-            # If OCR was used, the text variable contains the full OCR'd text. We need to truncate it.
-            # If OCR was not used, the text variable contains the full PyMuPDF text. We just replace it.
-            if len(text) > len(limited_text) and page_count > 0:
-                 text = text[:int(len(text) * (page_limit / page_count))]
-            else:
-                text = limited_text
-
+        doc.close()
         if not text.strip():
-            raise ValueError("Could not extract any text from the PDF, even after attempting OCR.")
+            raise ValueError("Could not extract text from the PDF.")
         return text
     except Exception as e:
-        logging.error(f"Full error in get_pdf_text_from_url_sync: {e}", exc_info=True)
         raise RuntimeError(f"Failed to process PDF: {e}")
 
 def get_text_chunks_advanced(text: str) -> List[str]:
@@ -115,52 +78,36 @@ def get_text_chunks_advanced(text: str) -> List[str]:
     chunks = text.split('\n\n')
     final_chunks = []
     for chunk in chunks:
-        if len(chunk) > 1000:
+        if len(chunk) > 1500: # Slightly larger chunk size
             sentences = re.split(r'(?<=[.!?]) +', chunk)
             final_chunks.extend(sentences)
         else:
             final_chunks.append(chunk)
     return [c.strip() for c in final_chunks if c.strip()]
 
-async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
-    """Processes one question using Multi-Query RAG for maximum accuracy."""
-    text_chunks = cached_data["chunks"]
-    chunk_embeddings = cached_data["embeddings"]
+async def get_single_answer(question: str, text_chunks: List[str], faiss_index_path: str) -> str:
+    """Processes one question using the on-disk FAISS index."""
     generative_model = genai.GenerativeModel('gemini-1.5-pro')
-    
+
     for attempt in range(3):
         try:
-            query_gen_prompt = f"""
-            You are an expert at rephrasing questions for a retrieval system.
-            Given the following question, generate 3 additional, different phrasings of it.
-            Your output MUST be a valid JSON array of strings.
+            # Load the FAISS index from disk for this search
+            index = faiss.read_index(faiss_index_path)
             
-            Original Question: "{question}"
-            
-            JSON Array of Rephrased Questions:
-            """
-            query_gen_model = genai.GenerativeModel('gemini-1.5-flash')
-            response = await asyncio.to_thread(lambda: query_gen_model.generate_content(query_gen_prompt))
-            
-            try:
-                cleaned_text = response.text.strip().replace('```json', '').replace('```', '').strip()
-                rephrased_questions = json.loads(cleaned_text)
-                all_queries = [question] + rephrased_questions
-            except json.JSONDecodeError:
-                logging.warning(f"Could not parse rephrased questions for '{question}'. Falling back to original question only.")
-                all_queries = [question]
-
-            query_embeddings = await asyncio.to_thread(
-                lambda: genai.embed_content(model='models/text-embedding-004', content=all_queries, task_type="RETRIEVAL_QUERY")['embedding']
+            question_embedding = await asyncio.to_thread(
+                lambda: genai.embed_content(model='models/text-embedding-004', content=question, task_type="RETRIEVAL_QUERY")['embedding']
             )
-
-            all_top_indices = set()
-            for embedding in query_embeddings:
-                dot_products = np.dot(np.array(chunk_embeddings), np.array(embedding))
-                top_indices = np.argsort(dot_products)[-3:][::-1]
-                all_top_indices.update(top_indices)
-
-            relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in all_top_indices])
+            
+            # FAISS expects a 2D array for searching
+            query_vector = np.array([question_embedding], dtype=np.float32)
+            
+            # Perform the search
+            distances, top_indices = index.search(query_vector, 10) # Retrieve top 10 results
+            
+            # Flatten the indices array
+            relevant_indices = top_indices[0]
+            
+            relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in relevant_indices])
             
             final_prompt = f"""
                 You are an expert AI research analyst. Your task is to synthesize a single, clear, and accurate answer to the "Question" based *only* on the provided "Sources".
@@ -190,40 +137,60 @@ async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
             else:
                 return "Error: Rate limit exceeded after multiple retries."
         except Exception as e:
-            logging.error(f"Failed to process question '{question}': {e}")
+            logging.error(f"Failed to process question '{question}': {e}", exc_info=True)
             return f"Error processing question: {e}"
     return "Error: Failed to get an answer after all attempts."
 
-# --- API Endpoint with On-Demand Caching ---
+# --- API Endpoint with On-Disk FAISS Caching ---
 @app.post("/hackrx/run", response_model=ApiResponse)
 async def process_request(request: ApiRequest, token: str = Depends(check_token)):
     document_url = request.documents
-    cache_key = document_url.split('?')[0]
-    logging.info(f"Processing request for document: {cache_key}")
+    cache_key = document_url.split('?')[0].split('/')[-1].replace('.pdf', '') # Use filename as key
+    faiss_index_path = os.path.join(CACHE_DIR, f"{cache_key}.index")
+    
+    logging.info(f"Processing request for document key: {cache_key}")
 
-    if cache_key not in document_cache:
-        logging.info(f"'{cache_key}' not in cache. Processing and caching now...")
+    if not os.path.exists(faiss_index_path):
+        logging.info(f"Index for '{cache_key}' not found on disk. Processing and creating index now (this will be slow)...")
         try:
             pdf_text = await asyncio.to_thread(get_pdf_text_from_url_sync, document_url)
             text_chunks = get_text_chunks_advanced(pdf_text)
+            
+            # Store text chunks in the in-memory cache
+            text_chunk_cache[cache_key] = text_chunks
+            
             chunk_embeddings = await asyncio.to_thread(
                 lambda: genai.embed_content(model='models/text-embedding-004', content=text_chunks, task_type="RETRIEVAL_DOCUMENT")['embedding']
             )
-            document_cache[cache_key] = {"chunks": text_chunks, "embeddings": chunk_embeddings}
-            logging.info(f"Successfully cached: {cache_key}")
+            
+            # --- Build and Save FAISS Index ---
+            embeddings_np = np.array(chunk_embeddings, dtype=np.float32)
+            d = embeddings_np.shape[1] # Dimension of vectors
+            index = faiss.IndexFlatL2(d)
+            index.add(embeddings_np)
+            faiss.write_index(index, faiss_index_path)
+            
+            logging.info(f"Successfully created and saved FAISS index for: {cache_key}")
         except Exception as e:
-            logging.error(f"Failed to process and cache document: {e}")
+            logging.error(f"Failed to process and create index for document: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to process document: {e}")
     else:
-        logging.info(f"Found '{cache_key}' in cache. Using cached data.")
-    
-    cached_data = document_cache[cache_key]
-    
-    answers = []
-    for question in request.questions:
-        answer = await get_single_answer(question, cached_data)
-        answers.append(answer)
+        logging.info(f"Found FAISS index for '{cache_key}' on disk.")
+        # Ensure text chunks are loaded if they aren't in memory
+        if cache_key not in text_chunk_cache:
+             logging.warning(f"Index found but chunks not in memory for {cache_key}. This should not happen frequently.")
+             # As a fallback, we'd need to re-process to get chunks, but this indicates a server restart.
+             # For the hackathon, we assume the server stays up long enough.
+             pdf_text = await asyncio.to_thread(get_pdf_text_from_url_sync, document_url)
+             text_chunk_cache[cache_key] = get_text_chunks_advanced(pdf_text)
 
+    
+    # Retrieve text chunks from the in-memory cache
+    current_text_chunks = text_chunk_cache[cache_key]
+    
+    tasks = [get_single_answer(q, current_text_chunks, faiss_index_path) for q in request.questions]
+    answers = await asyncio.gather(*tasks)
+    
     logging.info("Processing complete. Returning all answers.")
     return ApiResponse(answers=answers)
 
