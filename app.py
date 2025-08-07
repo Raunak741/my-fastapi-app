@@ -96,7 +96,7 @@ async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
     
     for attempt in range(3):
         try:
-            # --- NEW: Multi-Query Generation ---
+            # --- Multi-Query Generation with Robust JSON Parsing ---
             query_gen_prompt = f"""
             You are an expert at rephrasing questions for a retrieval system.
             Given the following question, generate 3 additional, different phrasings of it.
@@ -109,8 +109,16 @@ async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
             """
             query_gen_model = genai.GenerativeModel('gemini-1.5-flash')
             response = await asyncio.to_thread(lambda: query_gen_model.generate_content(query_gen_prompt))
-            rephrased_questions = json.loads(response.text)
-            all_queries = [question] + rephrased_questions
+            
+            # --- FINAL FIX: Robust JSON Parsing ---
+            try:
+                # Clean up potential markdown fences before parsing
+                cleaned_text = response.text.strip().replace('```json', '').replace('```', '').strip()
+                rephrased_questions = json.loads(cleaned_text)
+                all_queries = [question] + rephrased_questions
+            except json.JSONDecodeError:
+                logging.warning(f"Could not parse rephrased questions for '{question}'. Falling back to original question only.")
+                all_queries = [question]
 
             # --- Embed all queries ---
             query_embeddings = await asyncio.to_thread(
@@ -121,7 +129,6 @@ async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
             all_top_indices = set()
             for embedding in query_embeddings:
                 dot_products = np.dot(np.array(chunk_embeddings), np.array(embedding))
-                # Retrieve top 3 chunks for each query to get a diverse set
                 top_indices = np.argsort(dot_products)[-3:][::-1]
                 all_top_indices.update(top_indices)
 
