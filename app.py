@@ -66,12 +66,14 @@ def get_pdf_text_from_url_sync(url: str) -> str:
         response.raise_for_status()
         pdf_content = response.content
         
+        # --- CORRECTED LOGIC: Get all info before closing the document ---
         doc = fitz.open(stream=pdf_content, filetype="pdf")
+        page_count = doc.page_count
         text = "".join(page.get_text() for page in doc)
-        doc.close()
+        doc.close() # Close the document now
 
-        # Smart Detection for OCR
-        if doc.page_count > 1 and len(text.strip()) < (100 * doc.page_count):
+        # Smart Detection for OCR using the saved page_count
+        if page_count > 1 and len(text.strip()) < (100 * page_count):
             logging.warning(f"Low text detected. Attempting OCR with Google Cloud Vision for {url}")
             client = vision.ImageAnnotatorClient()
             gcs_feature = vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)
