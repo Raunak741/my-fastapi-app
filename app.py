@@ -54,15 +54,25 @@ class ApiResponse(BaseModel):
 
 # --- Core Logic Functions ---
 def get_pdf_text_from_url_sync(url: str) -> str:
-    """Downloads and extracts the full text from a PDF."""
+    """Downloads and extracts text with a generous memory-saving limit to beat the new timeout."""
     try:
-        response = requests.get(url, timeout=300) # Generous 5-minute timeout for huge files
+        response = requests.get(url, timeout=120) # 2-minute timeout for download
         response.raise_for_status()
         pdf_content = response.content
         
         doc = fitz.open(stream=pdf_content, filetype="pdf")
-        # --- NO PAGE LIMIT: Process the entire document for maximum accuracy ---
-        text = "".join(page.get_text() for page in doc)
+        page_count = doc.page_count
+        
+        # --- STRATEGIC CHANGE FOR REDUCED TIMEOUT ---
+        # A generous page limit to ensure processing is fast enough, while still being accurate.
+        page_limit = 250
+        if page_count > page_limit:
+            logging.warning(f"Document has {page_count} pages. Processing only the first {page_limit} to beat the reduced timeout.")
+            pages_to_process = range(page_limit)
+        else:
+            pages_to_process = range(page_count)
+            
+        text = "".join(doc[i].get_text() for i in pages_to_process)
         doc.close()
         
         if not text.strip():
