@@ -84,7 +84,7 @@ def get_text_chunks_advanced(text: str) -> List[str]:
     return [c.strip() for c in final_chunks if c.strip()]
 
 async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
-    """Processes one question using Multi-Query RAG."""
+    """Processes one question using Multi-Query RAG and an advanced prompt."""
     text_chunks = cached_data["chunks"]
     chunk_embeddings = cached_data["embeddings"]
     generative_model = genai.GenerativeModel('gemini-1.5-pro')
@@ -107,22 +107,22 @@ async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
             all_top_indices = set()
             for embedding in query_embeddings:
                 dot_products = np.dot(np.array(chunk_embeddings), np.array(embedding))
-                top_indices = np.argsort(dot_products)[-3:][::-1]
+                # --- FINAL ACCURACY TWEAK: Retrieve more context ---
+                top_indices = np.argsort(dot_products)[-4:][::-1] # Top 4 for each query
                 all_top_indices.update(top_indices)
 
             relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in all_top_indices])
             
-            # --- NEW, MORE POWERFUL PROMPT FOR HIGHER ACCURACY ---
+            # --- FINAL, MOST ACCURATE PROMPT ---
             final_prompt = f"""
-                You are a meticulous AI research analyst. Your task is to provide a single, definitive answer to the "Question" by strictly following these steps, using *only* the provided "Sources".
+                You are a meticulous AI research analyst. Your task is to provide a single, definitive answer to the "Question" by strictly following these instructions, using *only* the provided "Sources".
 
-                **Internal Thought Process (Do not include this in your final output):**
-                1.  **Fact Identification:** Scan all sources and identify every sentence, clause, number, and condition that is directly relevant to the question.
-                2.  **Synthesis & Reasoning:** Analyze the identified facts. If there are conflicting clauses (e.g., a general benefit and a specific exclusion), the most specific clause takes precedence. Construct a logical path from the facts to the answer.
-                3.  **Answer Formulation:** Formulate a single, comprehensive sentence that directly answers the question based on your reasoning.
-
-                **Your Final Output:**
-                Your entire output must be ONLY the single, final answer sentence you formulated in Step 3. Do not include your thought process, any introductory phrases, or any text other than the final answer.
+                **Instructions:**
+                1.  **Analyze Sources:** Carefully read all provided sources to understand the context.
+                2.  **Extract Key Details:** Identify and extract all specific quantitative details (e.g., numbers, percentages, time periods like "30 days") and the most critical conditions or clauses related to the question.
+                3.  **Formulate Final Answer:** Synthesize the extracted details into a single, comprehensive, and well-written sentence that directly answers the question. Your answer MUST include the specific quantitative details and the most important condition you found.
+                4.  **Handle Missing Information:** If the sources do not contain enough information to answer the question, you must state: "Based on the provided information, a definitive answer could not be found."
+                5.  **Output Format:** Your entire output must be ONLY the single, final answer sentence. Do not include your thought process, any introductory phrases, or any text other than the final answer.
 
                 **Sources:**
                 ---
