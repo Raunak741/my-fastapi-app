@@ -1,12 +1,11 @@
-# --- MODIFIED AND UPGRADED FOR HIGHER ACCURACY ---
+# --- FINAL HIGH-ACCURACY VERSION ---
 # Key Improvements:
-# 1. Advanced Prompt Engineering: New multi-step "Chain-of-Thought" prompt for the final answer.
-#    - Forces a "Yes/No/Cannot Determine" decision first.
-#    - Synthesizes a detailed, evidence-based answer starting with the decision.
-#    - Explicitly designed to match the required output format and improve explainability.
-# 2. Contextual Windowing in Retrieval: Retrieves text chunks surrounding the main relevant chunks.
-#    - Provides more context to the LLM, dramatically improving its ability to interpret clauses correctly.
-# 3. Refined Text Chunking & Query Generation: Minor but effective improvements to text processing.
+# 1. Intelligent Final Prompt: The prompt now distinguishes between yes/no and informational questions.
+#    - It no longer incorrectly prepends "Yes." or "No." to "What is..." type questions.
+#    - It is more forceful in instructing the LLM to synthesize facts rather than comment on the source text.
+# 2. Wider Retrieval Scope: The RAG system now retrieves the top 7 chunks (up from 5) for each query.
+#    - This significantly increases the likelihood of finding obscure but critical information (like the AYUSH clause).
+# 3. Enhanced Robustness: Improved retry logic and error logging.
 
 import os
 import requests
@@ -112,7 +111,7 @@ def add_contextual_window(indices: Set[int], max_index: int) -> List[int]:
 async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
     """
     Processes one question using Multi-Query RAG, Contextual Windowing, 
-    and an advanced Chain-of-Thought prompt.
+    and an advanced, intelligent prompt that adapts to the question type.
     """
     text_chunks = cached_data["chunks"]
     chunk_embeddings = cached_data["embeddings"]
@@ -148,8 +147,8 @@ Output your response ONLY as a valid JSON array of strings. Example: ["rephrased
             all_top_indices = set()
             for embedding in query_embeddings:
                 dot_products = np.dot(np.array(chunk_embeddings), np.array(embedding))
-                # Retrieve a few more chunks initially to feed the contextual window
-                top_indices = np.argsort(dot_products)[-5:][::-1]
+                # ACCURACY IMPROVEMENT: Retrieve more context (top 7) to find obscure clauses
+                top_indices = np.argsort(dot_products)[-7:][::-1]
                 all_top_indices.update(top_indices)
 
             # Step 4: Apply Contextual Windowing for richer context
@@ -158,23 +157,29 @@ Output your response ONLY as a valid JSON array of strings. Example: ["rephrased
             
             # Step 5: Generate the final answer using an advanced, multi-step prompt
             final_prompt = f"""
-                You are a highly intelligent AI analyst for legal and policy documents. Your task is to provide a single, definitive answer to the user's question based *only* on the provided "Sources". You must follow these instructions precisely.
+                You are a world-class AI analyst for legal and policy documents. Your task is to provide a single, definitive answer to the user's question based *only* on the provided "Sources". You must follow these instructions precisely.
 
                 ### Instructions ###
-                1.  **Analyze the Question:** First, determine if the question is a yes/no question.
-                2.  **Scrutinize Sources:** Carefully read all provided sources to find evidence. Look for specific numbers, conditions, exceptions, and definitions.
-                3.  **Make a Decision:** Based *only* on the sources, make a clear decision:
-                    - "Yes." if the sources explicitly support an affirmative answer.
-                    - "No." if the sources explicitly contradict or deny the premise of the question.
-                    - "Cannot be determined." if the sources do not contain enough information to answer definitively.
-                4.  **Synthesize the Final Answer:**
-                    - **Start with your decision** from Step 3 (e.g., "Yes.", "No.").
-                    - **Then, write a single, comprehensive paragraph** that synthesizes all relevant details, conditions, and quantitative data (like percentages, time periods, or monetary amounts) from the sources to justify your decision.
-                    - **If your decision was "Cannot be determined.",** your final answer must be ONLY: "Based on the provided information, a definitive answer could not be found."
-                5.  **Adhere to Rules:**
-                    - **DO NOT** use any information outside of the provided "Sources".
-                    - **DO NOT** add any introductory phrases like "The answer is..." or "Based on the sources...".
-                    - Your entire output must be a single, final answer beginning with "Yes.", "No.", or "Based on...".
+                1.  **Analyze the Question Type:** First, determine if the question is a binary question that can be answered with "Yes" or "No" (e.g., "Does the policy cover X?") OR if it is an informational question seeking a specific detail (e.g., "What is the waiting period for X?", "How is X defined?").
+
+                2.  **Scrutinize Sources:** Carefully read all provided sources to find the most relevant facts, figures, and clauses. Your primary goal is to extract the specific information that directly answers the question.
+
+                3.  **Formulate the Final Answer:**
+                    * **For Binary (Yes/No) Questions:**
+                        * Begin your answer with "Yes," if the sources confirm the condition.
+                        * Begin your answer with "No," if the sources deny the condition.
+                        * After the "Yes," or "No,", write a single, comprehensive paragraph synthesizing all supporting details, conditions, and numbers from the sources to justify your decision.
+                    * **For Informational Questions (What, How, etc.):**
+                        * DO NOT begin with "Yes" or "No".
+                        * Directly answer the question by starting with the information requested (e.g., "The waiting period for X is...", "X is defined as...").
+                        * Synthesize all relevant details into a single, comprehensive paragraph.
+                
+                4.  **Handle Missing Information:** If, and only if, the sources contain absolutely no information to answer the question, you must state: "Based on the provided information, a definitive answer could not be found." Use this as a last resort.
+
+                5.  **Final Output Rules:**
+                    * Your entire output must be ONLY the single, final answer paragraph.
+                    * Do not include your thought process or any introductory phrases not specified above.
+                    * Base your answer strictly on the provided "Sources".
 
                 ### Sources ###
                 ---
