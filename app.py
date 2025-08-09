@@ -1,4 +1,12 @@
-## app.py
+# --- MODIFIED AND UPGRADED FOR HIGHER ACCURACY ---
+# Key Improvements:
+# 1. Advanced Prompt Engineering: New multi-step "Chain-of-Thought" prompt for the final answer.
+#    - Forces a "Yes/No/Cannot Determine" decision first.
+#    - Synthesizes a detailed, evidence-based answer starting with the decision.
+#    - Explicitly designed to match the required output format and improve explainability.
+# 2. Contextual Windowing in Retrieval: Retrieves text chunks surrounding the main relevant chunks.
+#    - Provides more context to the LLM, dramatically improving its ability to interpret clauses correctly.
+# 3. Refined Text Chunking & Query Generation: Minor but effective improvements to text processing.
 
 import os
 import requests
@@ -8,11 +16,10 @@ import logging
 import asyncio
 import numpy as np
 import re
-import time
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Set
 from dotenv import load_dotenv
 import google.generativeai as genai
 import fitz  # PyMuPDF
@@ -56,101 +63,150 @@ class ApiResponse(BaseModel):
 def get_pdf_text_from_url_sync(url: str) -> str:
     """Downloads and extracts the full text from a PDF."""
     try:
-        response = requests.get(url, timeout=300) # Generous 5-minute timeout for huge files
+        response = requests.get(url, timeout=300)
         response.raise_for_status()
         pdf_content = response.content
         
-        doc = fitz.open(stream=pdf_content, filetype="pdf")
-        # --- NO PAGE LIMIT: Process the entire document for maximum accuracy ---
-        text = "".join(page.get_text() for page in doc)
-        doc.close()
+        with fitz.open(stream=pdf_content, filetype="pdf") as doc:
+            text = "".join(page.get_text() for page in doc)
         
         if not text.strip():
             raise ValueError("Could not extract any text from the PDF.")
         return text
     except Exception as e:
-        raise RuntimeError(f"Failed to process PDF: {e}")
+        raise RuntimeError(f"Failed to process PDF from URL {url}: {e}")
 
 def get_text_chunks_advanced(text: str) -> List[str]:
-    """Splits text into semantically meaningful chunks."""
-    chunks = text.split('\n\n')
+    """
+    Splits text into semantically meaningful chunks. This version uses a more robust
+    strategy by first splitting by paragraphs and then subdividing large paragraphs by sentences.
+    """
+    initial_chunks = text.split('\n\n')
     final_chunks = []
-    for chunk in chunks:
+    for chunk in initial_chunks:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        # If a chunk is too large, split it by sentences. A more robust regex is used.
         if len(chunk) > 1500:
-            sentences = re.split(r'(?<=[.!?]) +', chunk)
-            final_chunks.extend(sentences)
+            sentences = re.split(r'(?<=[.!?])\s+', chunk)
+            final_chunks.extend([s.strip() for s in sentences if s.strip()])
         else:
             final_chunks.append(chunk)
-    return [c.strip() for c in final_chunks if c.strip()]
+    return [c for c in final_chunks if c] # Filter out any potential empty strings
+
+def add_contextual_window(indices: Set[int], max_index: int) -> List[int]:
+    """
+    ACCURACY IMPROVEMENT: Contextual Windowing.
+    For each retrieved index, also include the preceding and succeeding chunks
+    to provide the LLM with more context for better interpretation.
+    """
+    expanded_indices = set(indices)
+    for i in indices:
+        if i > 0:
+            expanded_indices.add(i - 1)
+        if i < max_index:
+            expanded_indices.add(i + 1)
+    return sorted(list(expanded_indices))
 
 async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
-    """Processes one question using Multi-Query RAG and an advanced prompt."""
+    """
+    Processes one question using Multi-Query RAG, Contextual Windowing, 
+    and an advanced Chain-of-Thought prompt.
+    """
     text_chunks = cached_data["chunks"]
     chunk_embeddings = cached_data["embeddings"]
     generative_model = genai.GenerativeModel('gemini-1.5-pro')
     
-    for attempt in range(2): # Retry once on failure
+    for attempt in range(3): # Retry up to 2 times on failure
         try:
-            query_gen_prompt = f"""You are an expert at rephrasing questions. Given the question, generate 3 diverse phrasings. Output ONLY a valid JSON array of strings. Question: "{question}" """
+            # Step 1: Generate multiple query variations for better semantic search
+            query_gen_prompt = f"""You are an expert in semantic search. Given the user's question, generate 3 additional, rephrased versions of the question to improve the quality of information retrieval. The rephrased questions should be diverse and cover different angles of the original question.
+
+Original Question: "{question}"
+
+Output your response ONLY as a valid JSON array of strings. Example: ["rephrased question 1", "rephrased question 2", "rephrased question 3"]"""
+            
             query_gen_model = genai.GenerativeModel('gemini-1.5-flash')
             response = await asyncio.to_thread(lambda: query_gen_model.generate_content(query_gen_prompt))
             
             try:
-                cleaned_text = response.text.strip().replace('```json', '').replace('```', '').strip()
+                cleaned_text = re.search(r'\[.*\]', response.text, re.DOTALL).group(0)
                 rephrased_questions = json.loads(cleaned_text)
                 all_queries = [question] + rephrased_questions
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, AttributeError):
+                logging.warning(f"Failed to parse JSON for query variations. Using original question only for: '{question}'")
                 all_queries = [question]
 
-            query_embeddings = await asyncio.to_thread(lambda: genai.embed_content(model='models/text-embedding-004', content=all_queries, task_type="RETRIEVAL_QUERY")['embedding'])
+            # Step 2: Embed all queries
+            query_embeddings_result = await asyncio.to_thread(
+                lambda: genai.embed_content(model='models/text-embedding-004', content=all_queries, task_type="RETRIEVAL_QUERY")
+            )
+            query_embeddings = query_embeddings_result['embedding']
 
+            # Step 3: Retrieve relevant chunks for each query
             all_top_indices = set()
             for embedding in query_embeddings:
                 dot_products = np.dot(np.array(chunk_embeddings), np.array(embedding))
-                # --- FINAL ACCURACY TWEAK: Retrieve more context ---
-                top_indices = np.argsort(dot_products)[-4:][::-1] # Top 4 for each query
+                # Retrieve a few more chunks initially to feed the contextual window
+                top_indices = np.argsort(dot_products)[-5:][::-1]
                 all_top_indices.update(top_indices)
 
-            relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in all_top_indices])
+            # Step 4: Apply Contextual Windowing for richer context
+            expanded_indices = add_contextual_window(all_top_indices, len(text_chunks) - 1)
+            relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in expanded_indices])
             
-            # --- FINAL, MOST ACCURATE PROMPT ---
+            # Step 5: Generate the final answer using an advanced, multi-step prompt
             final_prompt = f"""
-                You are a meticulous AI research analyst. Your task is to provide a single, definitive answer to the "Question" by strictly following these instructions, using *only* the provided "Sources".
+                You are a highly intelligent AI analyst for legal and policy documents. Your task is to provide a single, definitive answer to the user's question based *only* on the provided "Sources". You must follow these instructions precisely.
 
-                **Instructions:**
-                1.  **Analyze Sources:** Carefully read all provided sources to understand the context.
-                2.  **Extract Key Details:** Identify and extract all specific quantitative details (e.g., numbers, percentages, time periods like "30 days") and the most critical conditions or clauses related to the question.
-                3.  **Formulate Final Answer:** Synthesize the extracted details into a single, comprehensive, and well-written sentence that directly answers the question. Your answer MUST include the specific quantitative details and the most important condition you found.
-                4.  **Handle Missing Information:** If the sources do not contain enough information to answer the question, you must state: "Based on the provided information, a definitive answer could not be found."
-                5.  **Output Format:** Your entire output must be ONLY the single, final answer sentence. Do not include your thought process, any introductory phrases, or any text other than the final answer.
+                ### Instructions ###
+                1.  **Analyze the Question:** First, determine if the question is a yes/no question.
+                2.  **Scrutinize Sources:** Carefully read all provided sources to find evidence. Look for specific numbers, conditions, exceptions, and definitions.
+                3.  **Make a Decision:** Based *only* on the sources, make a clear decision:
+                    - "Yes." if the sources explicitly support an affirmative answer.
+                    - "No." if the sources explicitly contradict or deny the premise of the question.
+                    - "Cannot be determined." if the sources do not contain enough information to answer definitively.
+                4.  **Synthesize the Final Answer:**
+                    - **Start with your decision** from Step 3 (e.g., "Yes.", "No.").
+                    - **Then, write a single, comprehensive paragraph** that synthesizes all relevant details, conditions, and quantitative data (like percentages, time periods, or monetary amounts) from the sources to justify your decision.
+                    - **If your decision was "Cannot be determined.",** your final answer must be ONLY: "Based on the provided information, a definitive answer could not be found."
+                5.  **Adhere to Rules:**
+                    - **DO NOT** use any information outside of the provided "Sources".
+                    - **DO NOT** add any introductory phrases like "The answer is..." or "Based on the sources...".
+                    - Your entire output must be a single, final answer beginning with "Yes.", "No.", or "Based on...".
 
-                **Sources:**
+                ### Sources ###
                 ---
                 {relevant_context}
                 ---
 
-                **Question:** {question}
+                ### Question ###
+                {question}
 
-                **Final Answer:**
+                ### Final Answer ###
             """
             final_response = await asyncio.to_thread(lambda: generative_model.generate_content(final_prompt))
             return final_response.text.strip()
 
         except google_exceptions.ResourceExhausted as e:
-            wait_time = 15
-            logging.warning(f"Rate limit hit. Waiting {wait_time}s...")
-            if attempt < 1: await asyncio.sleep(wait_time)
-            else: return "Error: Rate limit exceeded after multiple retries."
+            wait_time = (attempt + 1) * 10 # Exponential backoff
+            logging.warning(f"Rate limit hit. Waiting {wait_time}s before retry {attempt + 1}...")
+            if attempt < 2:
+                await asyncio.sleep(wait_time)
+            else:
+                return "Error: Rate limit exceeded after multiple retries."
         except Exception as e:
-            logging.error(f"Failed to process question '{question}': {e}")
-            return f"Error processing question: {e}"
+            logging.error(f"An unexpected error occurred processing question '{question}': {e}", exc_info=True)
+            return f"Error processing question: An unexpected error occurred."
+    
     return "Error: Failed to get an answer after all attempts."
 
 # --- API Endpoint with Final Caching & Parallel Logic ---
 @app.post("/hackrx/run", response_model=ApiResponse)
 async def process_request(request: ApiRequest, token: str = Depends(check_token)):
     document_url = request.documents
-    cache_key = document_url.split('?')[0]
+    cache_key = document_url.split('?')[0] # Use URL without query params as cache key
     logging.info(f"Processing request for document: {cache_key}")
 
     if cache_key not in document_cache:
@@ -158,20 +214,33 @@ async def process_request(request: ApiRequest, token: str = Depends(check_token)
         try:
             pdf_text = await asyncio.to_thread(get_pdf_text_from_url_sync, document_url)
             text_chunks = get_text_chunks_advanced(pdf_text)
-            chunk_embeddings = await asyncio.to_thread(
-                lambda: genai.embed_content(model='models/text-embedding-004', content=text_chunks, task_type="RETRIEVAL_DOCUMENT")['embedding']
-            )
+            
+            # Embed chunks in batches to avoid overwhelming the API
+            batch_size = 100
+            chunk_embeddings = []
+            for i in range(0, len(text_chunks), batch_size):
+                batch_chunks = text_chunks[i:i+batch_size]
+                embeddings_result = await asyncio.to_thread(
+                    lambda: genai.embed_content(
+                        model='models/text-embedding-004', 
+                        content=batch_chunks, 
+                        task_type="RETRIEVAL_DOCUMENT"
+                    )
+                )
+                chunk_embeddings.extend(embeddings_result['embedding'])
+                await asyncio.sleep(1) # Small delay to respect rate limits
+            
             document_cache[cache_key] = {"chunks": text_chunks, "embeddings": chunk_embeddings}
-            logging.info(f"Successfully cached: {cache_key}")
+            logging.info(f"Successfully cached {len(text_chunks)} chunks for: {cache_key}")
         except Exception as e:
-            logging.error(f"Failed to process and cache document: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to process document: {e}")
+            logging.error(f"Failed to process and cache document: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}")
     else:
         logging.info(f"Found '{cache_key}' in cache. Using cached data.")
     
     cached_data = document_cache[cache_key]
     
-    # --- Process all questions in PARALLEL for maximum speed ---
+    # Process all questions in PARALLEL for maximum speed
     tasks = [get_single_answer(q, cached_data) for q in request.questions]
     answers = await asyncio.gather(*tasks)
     
