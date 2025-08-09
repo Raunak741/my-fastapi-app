@@ -112,10 +112,27 @@ async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
 
             relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in all_top_indices])
             
-            final_prompt = f"""Answer the Question based ONLY on the Sources. Synthesize a single, comprehensive sentence. If the answer isn't in the Sources, state: "Based on the provided information, a definitive answer could not be found."
-**Sources:** --- {relevant_context} ---
-**Question:** {question}
-**Final Answer:**"""
+            # --- NEW, MORE POWERFUL PROMPT FOR HIGHER ACCURACY ---
+            final_prompt = f"""
+                You are a meticulous AI research analyst. Your task is to provide a single, definitive answer to the "Question" by strictly following these steps, using *only* the provided "Sources".
+
+                **Internal Thought Process (Do not include this in your final output):**
+                1.  **Fact Identification:** Scan all sources and identify every sentence, clause, number, and condition that is directly relevant to the question.
+                2.  **Synthesis & Reasoning:** Analyze the identified facts. If there are conflicting clauses (e.g., a general benefit and a specific exclusion), the most specific clause takes precedence. Construct a logical path from the facts to the answer.
+                3.  **Answer Formulation:** Formulate a single, comprehensive sentence that directly answers the question based on your reasoning.
+
+                **Your Final Output:**
+                Your entire output must be ONLY the single, final answer sentence you formulated in Step 3. Do not include your thought process, any introductory phrases, or any text other than the final answer.
+
+                **Sources:**
+                ---
+                {relevant_context}
+                ---
+
+                **Question:** {question}
+
+                **Final Answer:**
+            """
             final_response = await asyncio.to_thread(lambda: generative_model.generate_content(final_prompt))
             return final_response.text.strip()
 
