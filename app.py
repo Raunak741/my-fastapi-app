@@ -149,8 +149,9 @@ async def get_single_answer(question: str, text_chunks_with_metadata: List[Dict[
             # Format context with metadata for the prompt
             context_str = "\n\n---\n\n".join([f"Source: {chunk['source']}\nContent: {chunk['text']}" for chunk in relevant_chunks])
             
+            # --- FINAL, MOST ACCURATE PROMPT ---
             final_prompt = f"""
-                You are an expert AI research analyst. Your task is to provide a single, clear, and accurate answer to the "Question" based *only* on the provided "Sources".
+                You are a meticulous AI legal and compliance analyst. Your task is to provide a single, clear, and accurate answer to the "Question" based *only* on the provided "Sources".
                 You MUST return your response as a single, valid JSON object with three keys: "answer", "source", and "quote".
 
                 **Sources:**
@@ -161,10 +162,11 @@ async def get_single_answer(question: str, text_chunks_with_metadata: List[Dict[
                 **Question:** {question}
 
                 **Instructions:**
-                1.  Synthesize the information from the sources to formulate a comprehensive final answer.
-                2.  Identify the single most relevant "Source" citation (e.g., "Page 5" or "Section: Exclusions").
-                3.  Extract a direct, concise "quote" from the source text that best supports your answer.
-                4.  If the answer cannot be found, the "answer" should state that, the "source" should be "N/A", and the "quote" should be empty.
+                1.  **Synthesize:** Formulate a comprehensive final answer by synthesizing all relevant information from the sources.
+                2.  **Be Specific:** Your answer MUST include all critical details, conditions, quantitative values (e.g., "36 months", "5%"), and especially any exceptions or exclusions (e.g., "...this does not apply if...").
+                3.  **Cite:** Identify the single most relevant "Source" citation (e.g., "Page 9" or "Section: Exclusions") that contains the primary evidence for your answer.
+                4.  **Quote:** Extract a direct, concise "quote" from the source text that best supports your answer.
+                5.  **Handle Missing Info:** If the answer cannot be found in the sources, the "answer" should state that, the "source" should be "N/A", and the "quote" should be empty.
 
                 **Your Final JSON Output:**
             """
