@@ -56,7 +56,8 @@ class ApiResponse(BaseModel):
 def get_pdf_text_from_url_sync(url: str) -> str:
     """Downloads and extracts the full text from a PDF, with no page limits."""
     try:
-        response = requests.get(url, timeout=300) # Generous 5-minute timeout for huge files
+        # Generous 5-minute timeout for huge files, matching the server's expected limit
+        response = requests.get(url, timeout=300) 
         response.raise_for_status()
         pdf_content = response.content
         
@@ -84,45 +85,33 @@ def get_text_chunks_advanced(text: str) -> List[str]:
     return [c.strip() for c in final_chunks if c.strip()]
 
 async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
-    """Processes one question using Multi-Query RAG for maximum accuracy."""
+    """Processes one question using Multi-Query RAG and an advanced prompt."""
     text_chunks = cached_data["chunks"]
     chunk_embeddings = cached_data["embeddings"]
     generative_model = genai.GenerativeModel('gemini-1.5-pro')
     
     for attempt in range(2): # Retry once on failure
         try:
-            # --- NEW: Multi-Query Generation for better retrieval ---
-            query_gen_prompt = f"""You are an expert at rephrasing questions for a retrieval system.
-            Given the following question, generate 3 additional, different phrasings of it that cover different angles or keywords.
-            Your output MUST be a valid JSON array of strings.
-            
-            Original Question: "{question}"
-            
-            JSON Array of Rephrased Questions:
-            """
+            # --- Multi-Query Generation for better retrieval ---
+            query_gen_prompt = f"""You are an expert at rephrasing questions. Given the question, generate 3 diverse phrasings. Output ONLY a valid JSON array of strings. Question: "{question}" """
             query_gen_model = genai.GenerativeModel('gemini-1.5-flash')
             response = await asyncio.to_thread(lambda: query_gen_model.generate_content(query_gen_prompt))
             
             try:
-                # Robust JSON parsing
                 cleaned_text = response.text.strip().replace('```json', '').replace('```', '').strip()
                 rephrased_questions = json.loads(cleaned_text)
                 all_queries = [question] + rephrased_questions
             except json.JSONDecodeError:
-                logging.warning(f"Could not parse rephrased questions for '{question}'. Falling back to original question only.")
                 all_queries = [question]
 
             # --- Embed all queries ---
-            query_embeddings = await asyncio.to_thread(
-                lambda: genai.embed_content(model='models/text-embedding-004', content=all_queries, task_type="RETRIEVAL_QUERY")['embedding']
-            )
+            query_embeddings = await asyncio.to_thread(lambda: genai.embed_content(model='models/text-embedding-004', content=all_queries, task_type="RETRIEVAL_QUERY")['embedding'])
 
             # --- Retrieve and combine results for all queries ---
             all_top_indices = set()
             for embedding in query_embeddings:
                 dot_products = np.dot(np.array(chunk_embeddings), np.array(embedding))
-                # Retrieve top 3 chunks for each query to get a diverse set of results
-                top_indices = np.argsort(dot_products)[-3:][::-1]
+                top_indices = np.argsort(dot_products)[-4:][::-1] # Top 4 for each query
                 all_top_indices.update(top_indices)
 
             relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in all_top_indices])
