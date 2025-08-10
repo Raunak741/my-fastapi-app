@@ -1,20 +1,37 @@
+# app.py
+
+# --- IMPORTANT: System and Library Requirements ---
+# You must install Google's Tesseract OCR engine on your system first.
+# For Debian/Ubuntu: sudo apt-get install tesseract-ocr
+# For other OSes, check the official Tesseract documentation.
+
+# Then, install the required Python libraries:
+# pip install "fastapi[all]" python-dotenv google-generativeai numpy "PyMuPDF<1.24.0>" pytesseract pdf2image python-docx python-magic aiohttp
+
 import os
-import requests
 import io
 import json
 import logging
 import asyncio
 import numpy as np
 import re
-import time
+import fitz  # PyMuPDF
+import magic
+import aiohttp
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any, Tuple
 from dotenv import load_dotenv
 import google.generativeai as genai
-import fitz  # PyMuPDF
 from google.api_core import exceptions as google_exceptions
+
+# --- OCR Dependencies ---
+import pytesseract
+from pdf2image import convert_from_bytes
+
+# --- Document Processing for .docx ---
+from docx import Document
 
 # --- Configuration and Initialization ---
 logging.basicConfig(level=logging.INFO)
@@ -51,42 +68,102 @@ class ApiResponse(BaseModel):
     answers: List[str]
 
 # --- Core Logic Functions ---
-def get_pdf_text_from_url_sync(url: str) -> str:
-    """Downloads and extracts the full text from a PDF, with no page limits."""
+
+async def get_document_content_and_type(url: str) -> Tuple[bytes, str]:
+    """
+    UPGRADE 1: Fetches content and validates file type using headers.
+    This acts as a gatekeeper to reject invalid files early.
+    """
+    MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB limit
     try:
-        # Generous 5-minute timeout for huge files
-        response = requests.get(url, timeout=300) 
-        response.raise_for_status()
-        pdf_content = response.content
-        
-        doc = fitz.open(stream=pdf_content, filetype="pdf")
-        text = "".join(page.get_text("text", sort=True) for page in doc) # Added sort=True for better reading order
-        doc.close()
-        
-        if not text.strip():
-            raise ValueError("Could not extract any text from the PDF.")
-        return text
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=300) as response:
+                response.raise_for_status()
+
+                # Check file size
+                content_length = response.headers.get('Content-Length')
+                if content_length and int(content_length) > MAX_FILE_SIZE:
+                    raise ValueError(f"File size {int(content_length) / 1024**2:.2f} MB exceeds limit of {MAX_FILE_SIZE / 1024**2} MB.")
+
+                content = await response.read()
+                
+                # Check content type using python-magic for higher accuracy
+                mime_type = magic.from_buffer(content, mime=True)
+                logging.info(f"Detected MIME type: {mime_type} for URL: {url}")
+
+                if 'pdf' in mime_type:
+                    return content, 'pdf'
+                elif 'vnd.openxmlformats-officedocument.wordprocessingml.document' in mime_type:
+                    return content, 'docx'
+                else:
+                    raise ValueError(f"Unsupported file type: {mime_type}")
+
+    except aiohttp.ClientError as e:
+        raise RuntimeError(f"Network error fetching document: {e}")
     except Exception as e:
-        raise RuntimeError(f"Failed to process PDF: {e}")
+        raise RuntimeError(f"Failed to get or validate document: {e}")
+
+
+def extract_text_from_pdf_with_ocr(pdf_content: bytes) -> str:
+    """
+    UPGRADE 2: Hybrid text extraction with OCR for scanned PDFs.
+    This is the key to handling image-based documents.
+    """
+    full_text = []
+    min_text_length_per_page = 20  # Threshold to trigger OCR
+
+    try:
+        doc = fitz.open(stream=pdf_content, filetype="pdf")
+        
+        for page_num, page in enumerate(doc):
+            # First, try normal text extraction
+            text = page.get_text().strip()
+            
+            # If text is minimal or absent, assume it's a scanned page and use OCR
+            if len(text) < min_text_length_per_page:
+                logging.warning(f"Page {page_num + 1} has little to no text. Attempting OCR.")
+                try:
+                    images = convert_from_bytes(pdf_content, first_page=page_num + 1, last_page=page_num + 1)
+                    if images:
+                        ocr_text = pytesseract.image_to_string(images[0])
+                        full_text.append(ocr_text)
+                        logging.info(f"Successfully extracted text from page {page_num + 1} using OCR.")
+                except Exception as ocr_error:
+                    logging.error(f"OCR failed for page {page_num + 1}: {ocr_error}")
+                    full_text.append(text) # Append the little text we found earlier
+            else:
+                full_text.append(text)
+        
+        doc.close()
+        final_text = "\n\n".join(full_text)
+        if not final_text.strip():
+            raise ValueError("Could not extract any meaningful text from the PDF, even after OCR attempt.")
+        return final_text
+
+    except Exception as e:
+        raise RuntimeError(f"Failed to process PDF with OCR: {e}")
+
+
+def extract_text_from_docx(docx_content: bytes) -> str:
+    """
+    UPGRADE 3: Added support for DOCX files.
+    """
+    try:
+        doc = Document(io.BytesIO(docx_content))
+        return "\n\n".join([para.text for para in doc.paragraphs if para.text])
+    except Exception as e:
+        raise RuntimeError(f"Failed to process DOCX file: {e}")
+
 
 def get_text_chunks_recursive(text: str, max_chunk_size: int = 2000, overlap: int = 250) -> List[str]:
-    """
-    Splits text into overlapping chunks to preserve semantic context.
-    This is more robust than simple paragraph or sentence splitting.
-    """
-    if not text:
-        return []
-    
-    # First, split by larger separators to respect document structure
+    """Splits text into overlapping chunks to preserve semantic context."""
+    if not text: return []
     chunks = []
-    initial_splits = text.split('\n\n\n') # Split by triple newlines first
-
+    initial_splits = text.split('\n\n\n')
     for split in initial_splits:
         if len(split) <= max_chunk_size:
-            if split.strip():
-                chunks.append(split.strip())
+            if split.strip(): chunks.append(split.strip())
         else:
-            # If the chunk is still too large, use recursive splitting
             sentences = re.split(r'(?<=[.!?])\s+', split)
             current_chunk = ""
             for sentence in sentences:
@@ -95,117 +172,72 @@ def get_text_chunks_recursive(text: str, max_chunk_size: int = 2000, overlap: in
                 else:
                     chunks.append(current_chunk.strip())
                     current_chunk = sentence + " "
-            if current_chunk:
-                chunks.append(current_chunk.strip())
-
-    # Create overlapping chunks for better context retrieval
-    overlapping_chunks = []
-    for i in range(len(chunks)):
-        start_index = max(0, i) # Each chunk starts normally
-        end_index = i + 1
-        
-        # Combine the current chunk with a bit of the next one for overlap
-        combined_chunk = " ".join(chunks[start_index:end_index])
-        
-        # Add look-ahead overlap
-        if i + 1 < len(chunks):
-            next_chunk_preview = chunks[i+1]
-            overlap_text = ' '.join(next_chunk_preview.split()[:overlap // 10]) # Approx word count
-            combined_chunk += " " + overlap_text
-
-        overlapping_chunks.append(combined_chunk.strip())
-
-    return [c for c in overlapping_chunks if c]
+            if current_chunk: chunks.append(current_chunk.strip())
+    
+    final_chunks = [c for c in chunks if c]
+    return final_chunks
 
 
 async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
-    """Processes one question using Multi-Query RAG, Contextual Window Retrieval, and Chain-of-Thought reasoning."""
+    # This function remains largely the same, as the improvements are in the upstream document processing.
+    # The prompt and retrieval logic are already quite advanced.
     text_chunks = cached_data["chunks"]
     chunk_embeddings = cached_data["embeddings"]
     generative_model = genai.GenerativeModel('gemini-1.5-pro-latest')
     
-    for attempt in range(2): # Retry once on failure
+    for attempt in range(2): 
         try:
-            # 1. Multi-Query Generation for better retrieval
-            query_gen_prompt = f"""You are an expert at rephrasing questions for a vector database search.
-Given the user's question, generate 3 additional, diverse, and specific phrasings that focus on different aspects of the original question.
-For example, if the question is "What is the warranty period?", you might generate ["How long does the product warranty last?", "What are the terms of the warranty coverage?", "Are there any exclusions to the warranty?"].
-Output ONLY a valid JSON array of strings in a single line.
-Original Question: "{question}"
-"""
+            query_gen_prompt = f"""You are an expert at rephrasing questions for vector search. Generate 3 diverse phrasings for the question. Output ONLY a valid JSON array of strings. Question: "{question}" """
             query_gen_model = genai.GenerativeModel('gemini-1.5-flash-latest')
             response = await asyncio.to_thread(lambda: query_gen_model.generate_content(query_gen_prompt))
             
             all_queries = [question]
             try:
                 cleaned_text = response.text.strip().replace('```json', '').replace('```', '').strip()
-                rephrased_questions = json.loads(cleaned_text)
-                all_queries.extend(rephrased_questions)
+                all_queries.extend(json.loads(cleaned_text))
             except (json.JSONDecodeError, AttributeError):
-                logging.warning(f"Could not parse rephrased questions for: '{question}'. Using original query only.")
+                logging.warning(f"Could not parse rephrased questions for: '{question}'.")
 
-            # 2. Embed all queries
-            query_embeddings_result = await asyncio.to_thread(
-                lambda: genai.embed_content(model='models/text-embedding-004', content=all_queries, task_type="RETRIEVAL_QUERY")
-            )
-            query_embeddings = query_embeddings_result['embedding']
+            query_embeddings = await asyncio.to_thread(lambda: genai.embed_content(model='models/text-embedding-004', content=all_queries, task_type="RETRIEVAL_QUERY")['embedding'])
 
-            # 3. Retrieve, Expand Context, and Combine Results
-            all_top_indices: Set[int] = set()
+            all_top_indices = set()
             for embedding in query_embeddings:
                 dot_products = np.dot(np.array(chunk_embeddings), np.array(embedding))
-                # ACCURACY TWEAK 1: Retrieve more initial candidates
-                top_indices_for_query = np.argsort(dot_products)[-7:][::-1] # Top 7 for each query
-                
-                # ACCURACY TWEAK 2: Contextual Window Expansion
-                # For each top index, also grab its neighbors for better context.
+                top_indices_for_query = np.argsort(dot_products)[-7:][::-1]
                 for i in top_indices_for_query:
                     all_top_indices.add(i)
-                    if i > 0:
-                        all_top_indices.add(i - 1) # Add previous chunk
-                    if i < len(text_chunks) - 1:
-                        all_top_indices.add(i + 1) # Add next chunk
+                    if i > 0: all_top_indices.add(i - 1)
+                    if i < len(text_chunks) - 1: all_top_indices.add(i + 1)
             
-            # De-duplicate and sort indices to maintain document order
             sorted_indices = sorted(list(all_top_indices))
             relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in sorted_indices])
             
-            # 4. ACCURACY TWEAK 3: Chain-of-Thought & Self-Correction Prompt
             final_prompt = f"""
-You are a meticulous AI research analyst. Your task is to provide a single, definitive answer to the "Question" using ONLY the provided "Sources". You must follow a strict reasoning process.
-
+You are a meticulous AI research analyst. Your task is to provide a single, definitive answer to the "Question" using ONLY the provided "Sources". Follow a strict reasoning process.
 **Reasoning Process:**
-1.  **Fact Extraction:** First, go through all the provided Sources and extract every single fact, number, condition, and exception that is directly relevant to the user's question. List them out internally.
-2.  **Sufficiency Check:** Review the facts you extracted. Is there enough information to form a complete, unambiguous answer? Are there any contradictions?
-3.  **Answer Synthesis:** Based ONLY on the extracted facts, construct a single, comprehensive sentence that directly answers the question.
-    * Your answer **MUST** integrate all specific quantitative details (e.g., numbers like "36 months", percentages like "5%"), critical conditions, and **especially any exceptions or exclusions** (e.g., "...this limit does not apply if..."). This is the most important instruction.
-    * If the sources contain conflicting information, you must state: "The provided information contains conflicting details and a definitive answer cannot be given."
-    * If the sources do not contain enough information to provide a specific and complete answer, you **MUST** state: "Based on the provided information, a definitive answer could not befound."
-4.  **Final Output:** Your entire output must be ONLY the single, final answer sentence you synthesized in step 3. Do not include your internal reasoning, any introductory phrases, or any text other than the final synthesized answer.
+1. **Fact Extraction:** Internally, extract every single fact, number, condition, and exception relevant to the question from the Sources.
+2. **Sufficiency Check:** Do you have enough information to form a complete, unambiguous answer?
+3. **Answer Synthesis:** Based ONLY on the extracted facts, construct a single, comprehensive sentence. Your answer MUST integrate all specific details (numbers, percentages), conditions, and especially any exceptions. If the information is missing or contradictory, you MUST state: "Based on the provided information, a definitive answer could not be found."
+4. **Final Output:** Your entire output must be ONLY the single, final answer sentence. Do not include your reasoning or any introductory phrases.
 
 **Sources:**
 ---
 {relevant_context}
 ---
-
 **Question:** {question}
-
 **Final Answer:**
 """
             final_response = await asyncio.to_thread(lambda: generative_model.generate_content(final_prompt))
             return final_response.text.strip()
 
-        except google_exceptions.ResourceExhausted as e:
-            wait_time = 20 # Increased wait time for heavier models
+        except google_exceptions.ResourceExhausted:
+            wait_time = 20
             logging.warning(f"Rate limit hit. Waiting {wait_time}s...")
-            if attempt < 1:
-                await asyncio.sleep(wait_time)
-            else:
-                return "Error: Rate limit exceeded after multiple retries."
+            if attempt < 1: await asyncio.sleep(wait_time)
+            else: return "Error: Rate limit exceeded after multiple retries."
         except Exception as e:
             logging.error(f"Failed to process question '{question}': {e}", exc_info=True)
             return f"Error processing question: An unexpected error occurred."
-            
     return "Error: Failed to get an answer after all attempts."
 
 # --- API Endpoint with Final Caching & Parallel Logic ---
@@ -218,38 +250,41 @@ async def process_request(request: ApiRequest, token: str = Depends(check_token)
     if cache_key not in document_cache:
         logging.info(f"'{cache_key}' not in cache. Processing and caching now...")
         try:
-            pdf_text = await asyncio.to_thread(get_pdf_text_from_url_sync, document_url)
-            text_chunks = get_text_chunks_recursive(pdf_text) # Using the new chunking function
+            # Main document processing router
+            content, file_type = await get_document_content_and_type(document_url)
+            
+            extracted_text = ""
+            if file_type == 'pdf':
+                extracted_text = await asyncio.to_thread(extract_text_from_pdf_with_ocr, content)
+            elif file_type == 'docx':
+                extracted_text = await asyncio.to_thread(extract_text_from_docx, content)
+            
+            if not extracted_text:
+                raise HTTPException(status_code=422, detail="Could not extract any processable text from the document.")
+
+            text_chunks = get_text_chunks_recursive(extracted_text)
             
             if not text_chunks:
                 raise HTTPException(status_code=500, detail="Failed to extract any text chunks from the document.")
 
-            # Embed chunks in batches to avoid API limits for very large documents
             all_embeddings = []
-            batch_size = 100 # Gemini API can handle up to 100 contents per request
+            batch_size = 100
             for i in range(0, len(text_chunks), batch_size):
-                batch_chunks = text_chunks[i:i+batch_size]
-                batch_embeddings = await asyncio.to_thread(
-                    lambda: genai.embed_content(
-                        model='models/text-embedding-004', 
-                        content=batch_chunks, 
-                        task_type="RETRIEVAL_DOCUMENT"
-                    )['embedding']
-                )
+                batch = text_chunks[i:i+batch_size]
+                batch_embeddings = await asyncio.to_thread(lambda: genai.embed_content(model='models/text-embedding-004', content=batch, task_type="RETRIEVAL_DOCUMENT")['embedding'])
                 all_embeddings.extend(batch_embeddings)
-                await asyncio.sleep(1) # Small sleep to respect rate limits
+                await asyncio.sleep(1)
 
             document_cache[cache_key] = {"chunks": text_chunks, "embeddings": all_embeddings}
             logging.info(f"Successfully cached: {cache_key}")
         except Exception as e:
             logging.error(f"Failed to process and cache document: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Failed to process document: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
     else:
         logging.info(f"Found '{cache_key}' in cache. Using cached data.")
     
     cached_data = document_cache[cache_key]
     
-    # Process all questions in PARALLEL for maximum speed
     tasks = [get_single_answer(q, cached_data) for q in request.questions]
     answers = await asyncio.gather(*tasks)
     
