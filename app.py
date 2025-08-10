@@ -16,10 +16,7 @@ from typing import List, Dict, Any
 from dotenv import load_dotenv
 import google.generativeai as genai
 import fitz  # PyMuPDF
-import docx # python-docx
-import extract_msg # for .msg and .eml files
 from google.api_core import exceptions as google_exceptions
-import faiss
 
 # --- Configuration and Initialization ---
 logging.basicConfig(level=logging.INFO)
@@ -33,12 +30,8 @@ if not GEMINI_API_KEY or not TEAM_TOKEN:
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# --- On-Disk Cache Management ---
-CACHE_DIR = "faiss_cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
-METADATA_CACHE_DIR = "metadata_cache"
-os.makedirs(METADATA_CACHE_DIR, exist_ok=True)
-
+# --- In-Memory Cache ---
+document_cache: Dict[str, Dict[str, Any]] = {}
 
 # --- FastAPI App Initialization ---
 app = FastAPI()
@@ -51,110 +44,90 @@ def check_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=403, detail="Invalid authorization token")
     return credentials.credentials
 
-# --- Pydantic Models (Reverted to simple string list) ---
-class ApiResponse(BaseModel):
-    answers: List[str]
-
+# --- Pydantic Models ---
 class ApiRequest(BaseModel):
     documents: str
     questions: List[str]
 
+class ApiResponse(BaseModel):
+    answers: List[str]
+
 # --- Core Logic Functions ---
-
-def get_document_content(url: str) -> (bytes, str):
-    """Downloads content from a URL and determines its file type."""
+def get_pdf_text_from_url_sync(url: str) -> str:
+    """Downloads and extracts the full text from a PDF, with no page limits."""
     try:
-        response = requests.get(url, timeout=180)
+        response = requests.get(url, timeout=300) # Generous 5-minute timeout for huge files
         response.raise_for_status()
-        content_type = response.headers.get('Content-Type', '')
+        pdf_content = response.content
         
-        if 'pdf' in content_type:
-            file_type = 'pdf'
-        elif 'vnd.openxmlformats-officedocument.wordprocessingml.document' in content_type:
-            file_type = 'docx'
-        elif 'message/rfc822' in content_type:
-            file_type = 'eml'
-        else:
-            if url.lower().endswith('.pdf'): file_type = 'pdf'
-            elif url.lower().endswith('.docx'): file_type = 'docx'
-            elif url.lower().endswith('.eml') or url.lower().endswith('.msg'): file_type = 'eml'
-            else: raise ValueError(f"Unsupported file type: {content_type}")
-            
-        return response.content, file_type
-    except Exception as e:
-        raise RuntimeError(f"Failed to download or identify document: {e}")
-
-def chunk_document_with_metadata(content: bytes, file_type: str) -> List[Dict[str, Any]]:
-    """Extracts text and creates chunks with page/clause metadata."""
-    chunks_with_metadata = []
-    
-    if file_type == 'pdf':
-        doc = fitz.open(stream=content, filetype="pdf")
-        for page_num, page in enumerate(doc):
-            text = page.get_text("text")
-            paragraphs = text.split('\n\n')
-            for para in paragraphs:
-                if para.strip():
-                    chunks_with_metadata.append({
-                        "text": para.strip(),
-                        "source": f"Page {page_num + 1}"
-                    })
+        doc = fitz.open(stream=pdf_content, filetype="pdf")
+        # --- NO PAGE LIMIT: Process the entire document for maximum accuracy ---
+        text = "".join(page.get_text() for page in doc)
         doc.close()
+        
+        if not text.strip():
+            raise ValueError("Could not extract any text from the PDF.")
+        return text
+    except Exception as e:
+        raise RuntimeError(f"Failed to process PDF: {e}")
 
-    elif file_type == 'docx':
-        doc = docx.Document(io.BytesIO(content))
-        current_heading = "General"
-        for para in doc.paragraphs:
-            if para.style.name.startswith('Heading'):
-                current_heading = para.text.strip()
-            if para.text.strip():
-                chunks_with_metadata.append({
-                    "text": para.text.strip(),
-                    "source": f"Section: {current_heading}"
-                })
+def get_text_chunks_advanced(text: str) -> List[str]:
+    """Splits text into semantically meaningful chunks."""
+    chunks = text.split('\n\n')
+    final_chunks = []
+    for chunk in chunks:
+        if len(chunk) > 1500:
+            sentences = re.split(r'(?<=[.!?]) +', chunk)
+            final_chunks.extend(sentences)
+        else:
+            final_chunks.append(chunk)
+    return [c.strip() for c in final_chunks if c.strip()]
 
-    elif file_type == 'eml':
-        msg = extract_msg.Message(io.BytesIO(content))
-        chunks_with_metadata.append({"text": f"From: {msg.sender}\nTo: {msg.to}\nSubject: {msg.subject}", "source": "Email Header"})
-        chunks_with_metadata.append({"text": msg.body, "source": "Email Body"})
-
-    return chunks_with_metadata
-
-
-async def get_single_answer(question: str, text_chunks_with_metadata: List[Dict[str, Any]], faiss_index_path: str) -> str:
-    """Processes one question and returns a single answer string."""
+async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
+    """Processes one question using Multi-Query RAG and an advanced prompt."""
+    text_chunks = cached_data["chunks"]
+    chunk_embeddings = cached_data["embeddings"]
     generative_model = genai.GenerativeModel('gemini-1.5-pro')
-
-    for attempt in range(2):
+    
+    for attempt in range(2): # Retry once on failure
         try:
-            index = faiss.read_index(faiss_index_path)
+            query_gen_prompt = f"""You are an expert at rephrasing questions. Given the question, generate 3 diverse phrasings. Output ONLY a valid JSON array of strings. Question: "{question}" """
+            query_gen_model = genai.GenerativeModel('gemini-1.5-flash')
+            response = await asyncio.to_thread(lambda: query_gen_model.generate_content(query_gen_prompt))
             
-            question_embedding = await asyncio.to_thread(
-                lambda: genai.embed_content(model='models/text-embedding-004', content=question, task_type="RETRIEVAL_QUERY")['embedding']
-            )
+            try:
+                cleaned_text = response.text.strip().replace('```json', '').replace('```', '').strip()
+                rephrased_questions = json.loads(cleaned_text)
+                all_queries = [question] + rephrased_questions
+            except json.JSONDecodeError:
+                all_queries = [question]
+
+            query_embeddings = await asyncio.to_thread(lambda: genai.embed_content(model='models/text-embedding-004', content=all_queries, task_type="RETRIEVAL_QUERY")['embedding'])
+
+            all_top_indices = set()
+            for embedding in query_embeddings:
+                dot_products = np.dot(np.array(chunk_embeddings), np.array(embedding))
+                top_indices = np.argsort(dot_products)[-4:][::-1] # Top 4 for each query
+                all_top_indices.update(top_indices)
+
+            relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in all_top_indices])
             
-            query_vector = np.array([question_embedding], dtype=np.float32)
-            distances, top_indices = index.search(query_vector, 10)
-            
-            relevant_chunks = [text_chunks_with_metadata[i] for i in top_indices[0]]
-            context_str = "\n\n---\n\n".join([chunk['text'] for chunk in relevant_chunks])
-            
-            # --- FINAL, MOST ACCURATE PROMPT for simple string output ---
             final_prompt = f"""
-                You are a meticulous AI legal and compliance analyst. Your task is to provide a single, clear, and accurate answer to the "Question" based *only* on the provided "Sources".
+                You are a meticulous AI research analyst. Your task is to provide a single, definitive answer to the "Question" by strictly following these instructions, using *only* the provided "Sources".
+
+                **Instructions:**
+                1.  **Analyze Sources:** Carefully read all provided sources to understand the context.
+                2.  **Extract Key Details:** Identify and extract all specific quantitative details (e.g., numbers, percentages, time periods like "30 days") and the most critical conditions or clauses related to the question.
+                3.  **Formulate Final Answer:** Synthesize the extracted details into a single, comprehensive, and well-written sentence that directly answers the question. Your answer MUST include the specific quantitative details and the most important condition you found.
+                4.  **Handle Missing Information:** If the sources do not contain enough information to answer the question, you must state: "Based on the provided information, a definitive answer could not be found."
+                5.  **Output Format:** Your entire output must be ONLY the single, final answer sentence. Do not include your thought process, any introductory phrases, or any text other than the final answer.
 
                 **Sources:**
                 ---
-                {context_str}
+                {relevant_context}
                 ---
 
                 **Question:** {question}
-
-                **Instructions:**
-                1.  **Synthesize:** Formulate a comprehensive final answer by synthesizing all relevant information from the sources.
-                2.  **Be Specific:** Your answer MUST include all critical details, conditions, quantitative values (e.g., "36 months", "5%"), and especially any exceptions or exclusions (e.g., "...this does not apply if...").
-                3.  **Handle Missing Info:** If the answer cannot be found in the sources, you must state: "Based on the provided information, a definitive answer could not be found."
-                4.  **Output Format:** Your entire output must be ONLY the single, final answer sentence. Do not include your thought process, any introductory phrases, or any text other than the final answer.
 
                 **Final Answer:**
             """
@@ -162,55 +135,42 @@ async def get_single_answer(question: str, text_chunks_with_metadata: List[Dict[
             return final_response.text.strip()
 
         except google_exceptions.ResourceExhausted as e:
-            logging.warning(f"Retrying question '{question}' due to: {e}")
-            if attempt < 1: await asyncio.sleep(15)
-            else: return "Error: Failed after multiple retries."
+            wait_time = 15
+            logging.warning(f"Rate limit hit. Waiting {wait_time}s...")
+            if attempt < 1: await asyncio.sleep(wait_time)
+            else: return "Error: Rate limit exceeded after multiple retries."
         except Exception as e:
-            logging.error(f"Failed to process question '{question}': {e}", exc_info=True)
+            logging.error(f"Failed to process question '{question}': {e}")
             return f"Error processing question: {e}"
-    return "Error: Failed after all attempts."
+    return "Error: Failed to get an answer after all attempts."
 
-
-# --- API Endpoint with On-Disk FAISS Caching ---
+# --- API Endpoint with Final Caching & Parallel Logic ---
 @app.post("/hackrx/run", response_model=ApiResponse)
 async def process_request(request: ApiRequest, token: str = Depends(check_token)):
     document_url = request.documents
-    cache_key = document_url.split('?')[0].split('/')[-1]
-    faiss_index_path = os.path.join(CACHE_DIR, f"{cache_key}.index")
-    metadata_path = os.path.join(METADATA_CACHE_DIR, f"{cache_key}.json")
-    
-    logging.info(f"Processing request for document key: {cache_key}")
+    cache_key = document_url.split('?')[0]
+    logging.info(f"Processing request for document: {cache_key}")
 
-    if not os.path.exists(faiss_index_path):
-        logging.info(f"Index for '{cache_key}' not found. Processing and creating index now (this will be slow)...")
+    if cache_key not in document_cache:
+        logging.info(f"'{cache_key}' not in cache. Processing and caching now...")
         try:
-            content, file_type = await asyncio.to_thread(get_document_content, document_url)
-            chunks_with_metadata = chunk_document_with_metadata(content, file_type)
-            
-            with open(metadata_path, 'w') as f:
-                json.dump(chunks_with_metadata, f)
-            
-            text_chunks = [chunk['text'] for chunk in chunks_with_metadata]
-            
+            pdf_text = await asyncio.to_thread(get_pdf_text_from_url_sync, document_url)
+            text_chunks = get_text_chunks_advanced(pdf_text)
             chunk_embeddings = await asyncio.to_thread(
                 lambda: genai.embed_content(model='models/text-embedding-004', content=text_chunks, task_type="RETRIEVAL_DOCUMENT")['embedding']
             )
-            
-            embeddings_np = np.array(chunk_embeddings, dtype=np.float32)
-            d = embeddings_np.shape[1]
-            index = faiss.IndexFlatL2(d)
-            index.add(embeddings_np)
-            faiss.write_index(index, faiss_index_path)
-            
-            logging.info(f"Successfully created FAISS index and metadata for: {cache_key}")
+            document_cache[cache_key] = {"chunks": text_chunks, "embeddings": chunk_embeddings}
+            logging.info(f"Successfully cached: {cache_key}")
         except Exception as e:
-            logging.error(f"Failed to process and create index for document: {e}")
+            logging.error(f"Failed to process and cache document: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to process document: {e}")
+    else:
+        logging.info(f"Found '{cache_key}' in cache. Using cached data.")
     
-    with open(metadata_path, 'r') as f:
-        current_chunks_with_metadata = json.load(f)
+    cached_data = document_cache[cache_key]
     
-    tasks = [get_single_answer(q, current_chunks_with_metadata, faiss_index_path) for q in request.questions]
+    # --- Process all questions in PARALLEL for maximum speed ---
+    tasks = [get_single_answer(q, cached_data) for q in request.questions]
     answers = await asyncio.gather(*tasks)
     
     logging.info("Processing complete. Returning all answers.")
