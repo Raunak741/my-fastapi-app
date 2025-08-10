@@ -84,34 +84,29 @@ def get_text_chunks_advanced(text: str) -> List[str]:
     return [c.strip() for c in final_chunks if c.strip()]
 
 async def get_single_answer(question: str, cached_data: Dict[str, Any]) -> str:
-    """Processes one question using Multi-Query RAG and an advanced prompt."""
+    """Processes one question using a direct RAG approach for maximum speed and accuracy."""
     text_chunks = cached_data["chunks"]
     chunk_embeddings = cached_data["embeddings"]
     generative_model = genai.GenerativeModel('gemini-1.5-pro')
     
     for attempt in range(2): # Retry once on failure
         try:
-            query_gen_prompt = f"""You are an expert at rephrasing questions. Given the question, generate 3 diverse phrasings. Output ONLY a valid JSON array of strings. Question: "{question}" """
-            query_gen_model = genai.GenerativeModel('gemini-1.5-flash')
-            response = await asyncio.to_thread(lambda: query_gen_model.generate_content(query_gen_prompt))
+            # --- Simplified Retrieval: Direct embedding of the original question ---
+            question_embedding = await asyncio.to_thread(
+                lambda: genai.embed_content(
+                    model='models/text-embedding-004',
+                    content=question,
+                    task_type="RETRIEVAL_QUERY"
+                )['embedding']
+            )
+
+            dot_products = np.dot(np.array(chunk_embeddings), np.array(question_embedding))
+            # --- Retrieve a wider context to compensate for no multi-query ---
+            top_indices = np.argsort(dot_products)[-10:][::-1] # Top 10 most relevant chunks
             
-            try:
-                cleaned_text = response.text.strip().replace('```json', '').replace('```', '').strip()
-                rephrased_questions = json.loads(cleaned_text)
-                all_queries = [question] + rephrased_questions
-            except json.JSONDecodeError:
-                all_queries = [question]
-
-            query_embeddings = await asyncio.to_thread(lambda: genai.embed_content(model='models/text-embedding-004', content=all_queries, task_type="RETRIEVAL_QUERY")['embedding'])
-
-            all_top_indices = set()
-            for embedding in query_embeddings:
-                dot_products = np.dot(np.array(chunk_embeddings), np.array(embedding))
-                top_indices = np.argsort(dot_products)[-4:][::-1] # Top 4 for each query
-                all_top_indices.update(top_indices)
-
-            relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in all_top_indices])
+            relevant_context = "\n\n---\n\n".join([text_chunks[i] for i in top_indices])
             
+            # --- Final, High-Accuracy Prompt ---
             final_prompt = f"""
                 You are a meticulous AI research analyst. Your task is to provide a single, definitive answer to the "Question" by strictly following these instructions, using *only* the provided "Sources".
 
