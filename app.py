@@ -36,7 +36,6 @@ genai.configure(api_key=GEMINI_API_KEY)
 # --- On-Disk Cache Management ---
 CACHE_DIR = "faiss_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
-# We will store the text chunks + metadata in a separate JSON file for easy access.
 METADATA_CACHE_DIR = "metadata_cache"
 os.makedirs(METADATA_CACHE_DIR, exist_ok=True)
 
@@ -52,14 +51,9 @@ def check_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=403, detail="Invalid authorization token")
     return credentials.credentials
 
-# --- Pydantic Models for Structured, Explainable Output ---
-class AnswerSource(BaseModel):
-    answer: str
-    source: str
-    quote: str
-
+# --- Pydantic Models (Reverted to simple string list) ---
 class ApiResponse(BaseModel):
-    answers: List[AnswerSource]
+    answers: List[str]
 
 class ApiRequest(BaseModel):
     documents: str
@@ -81,7 +75,6 @@ def get_document_content(url: str) -> (bytes, str):
         elif 'message/rfc822' in content_type:
             file_type = 'eml'
         else:
-            # Fallback for URLs without proper content-type
             if url.lower().endswith('.pdf'): file_type = 'pdf'
             elif url.lower().endswith('.docx'): file_type = 'docx'
             elif url.lower().endswith('.eml') or url.lower().endswith('.msg'): file_type = 'eml'
@@ -99,7 +92,6 @@ def chunk_document_with_metadata(content: bytes, file_type: str) -> List[Dict[st
         doc = fitz.open(stream=content, filetype="pdf")
         for page_num, page in enumerate(doc):
             text = page.get_text("text")
-            # Simple paragraph chunking for PDFs
             paragraphs = text.split('\n\n')
             for para in paragraphs:
                 if para.strip():
@@ -129,8 +121,8 @@ def chunk_document_with_metadata(content: bytes, file_type: str) -> List[Dict[st
     return chunks_with_metadata
 
 
-async def get_single_answer(question: str, text_chunks_with_metadata: List[Dict[str, Any]], faiss_index_path: str) -> Dict[str, str]:
-    """Processes one question using the on-disk FAISS index and returns a structured answer."""
+async def get_single_answer(question: str, text_chunks_with_metadata: List[Dict[str, Any]], faiss_index_path: str) -> str:
+    """Processes one question and returns a single answer string."""
     generative_model = genai.GenerativeModel('gemini-1.5-pro')
 
     for attempt in range(2):
@@ -145,14 +137,11 @@ async def get_single_answer(question: str, text_chunks_with_metadata: List[Dict[
             distances, top_indices = index.search(query_vector, 10)
             
             relevant_chunks = [text_chunks_with_metadata[i] for i in top_indices[0]]
+            context_str = "\n\n---\n\n".join([chunk['text'] for chunk in relevant_chunks])
             
-            # Format context with metadata for the prompt
-            context_str = "\n\n---\n\n".join([f"Source: {chunk['source']}\nContent: {chunk['text']}" for chunk in relevant_chunks])
-            
-            # --- FINAL, MOST ACCURATE PROMPT ---
+            # --- FINAL, MOST ACCURATE PROMPT for simple string output ---
             final_prompt = f"""
                 You are a meticulous AI legal and compliance analyst. Your task is to provide a single, clear, and accurate answer to the "Question" based *only* on the provided "Sources".
-                You MUST return your response as a single, valid JSON object with three keys: "answer", "source", and "quote".
 
                 **Sources:**
                 ---
@@ -164,33 +153,29 @@ async def get_single_answer(question: str, text_chunks_with_metadata: List[Dict[
                 **Instructions:**
                 1.  **Synthesize:** Formulate a comprehensive final answer by synthesizing all relevant information from the sources.
                 2.  **Be Specific:** Your answer MUST include all critical details, conditions, quantitative values (e.g., "36 months", "5%"), and especially any exceptions or exclusions (e.g., "...this does not apply if...").
-                3.  **Cite:** Identify the single most relevant "Source" citation (e.g., "Page 9" or "Section: Exclusions") that contains the primary evidence for your answer.
-                4.  **Quote:** Extract a direct, concise "quote" from the source text that best supports your answer.
-                5.  **Handle Missing Info:** If the answer cannot be found in the sources, the "answer" should state that, the "source" should be "N/A", and the "quote" should be empty.
+                3.  **Handle Missing Info:** If the answer cannot be found in the sources, you must state: "Based on the provided information, a definitive answer could not be found."
+                4.  **Output Format:** Your entire output must be ONLY the single, final answer sentence. Do not include your thought process, any introductory phrases, or any text other than the final answer.
 
-                **Your Final JSON Output:**
+                **Final Answer:**
             """
             final_response = await asyncio.to_thread(lambda: generative_model.generate_content(final_prompt))
-            
-            # Clean and parse the JSON output from the model
-            cleaned_text = final_response.text.strip().replace('```json', '').replace('```', '').strip()
-            return json.loads(cleaned_text)
+            return final_response.text.strip()
 
-        except (google_exceptions.ResourceExhausted, json.JSONDecodeError) as e:
+        except google_exceptions.ResourceExhausted as e:
             logging.warning(f"Retrying question '{question}' due to: {e}")
             if attempt < 1: await asyncio.sleep(15)
-            else: return {"answer": "Error: Failed after multiple retries.", "source": "N/A", "quote": ""}
+            else: return "Error: Failed after multiple retries."
         except Exception as e:
             logging.error(f"Failed to process question '{question}': {e}", exc_info=True)
-            return {"answer": f"Error processing question: {e}", "source": "N/A", "quote": ""}
-    return {"answer": "Error: Failed after all attempts.", "source": "N/A", "quote": ""}
+            return f"Error processing question: {e}"
+    return "Error: Failed after all attempts."
 
 
 # --- API Endpoint with On-Disk FAISS Caching ---
 @app.post("/hackrx/run", response_model=ApiResponse)
 async def process_request(request: ApiRequest, token: str = Depends(check_token)):
     document_url = request.documents
-    cache_key = document_url.split('?')[0].split('/')[-1] # Use filename as key
+    cache_key = document_url.split('?')[0].split('/')[-1]
     faiss_index_path = os.path.join(CACHE_DIR, f"{cache_key}.index")
     metadata_path = os.path.join(METADATA_CACHE_DIR, f"{cache_key}.json")
     
@@ -202,7 +187,6 @@ async def process_request(request: ApiRequest, token: str = Depends(check_token)
             content, file_type = await asyncio.to_thread(get_document_content, document_url)
             chunks_with_metadata = chunk_document_with_metadata(content, file_type)
             
-            # Save metadata to disk
             with open(metadata_path, 'w') as f:
                 json.dump(chunks_with_metadata, f)
             
@@ -223,7 +207,6 @@ async def process_request(request: ApiRequest, token: str = Depends(check_token)
             logging.error(f"Failed to process and create index for document: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to process document: {e}")
     
-    # Load metadata from disk
     with open(metadata_path, 'r') as f:
         current_chunks_with_metadata = json.load(f)
     
